@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.0
+// @version      0.9.1
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -220,9 +220,13 @@
   }
 
   // Сбор и отправка за ОДНУ дату (dd.MM.yyyy) для уже определённого офиса.
-  async function runForDate(date, office, pvz, log) {
+  // ignoreSeen — начать день с чистого листа. Нужно для добора: в потерянные дни
+  // кэш уже забит номерами заказов (старая версия помечала их ДО отправки), и без
+  // сброса добор вернул бы 0 ровно за те дни, которые и надо вернуть.
+  // Повторной отправки бояться не нужно: приёмник дедуплицирует по номеру заказа.
+  async function runForDate(date, office, pvz, log, ignoreSeen) {
     const t0 = Date.now();
-    const seen = loadSeen(date);
+    const seen = ignoreSeen ? new Set() : loadSeen(date);
     let all = [], raw = 0, dropped = 0;
 
     // 1) ОТПРАВИТЕЛИ (физики-лиды) — оформлено нашим ПВЗ
@@ -257,7 +261,7 @@
       return { ok: true, count: 0, date, raw, dropped };
     }
 
-    const payload = { source: 'ec5-traffic-userscript', version: '0.9.0', date, pvz, records: all };
+    const payload = { source: 'ec5-traffic-userscript', version: '0.9.1', date, pvz, records: all };
     let sent = false, why = '';
     try {
       const res = await http('POST', CONFIG.INGEST_URL, payload);
@@ -321,8 +325,9 @@
     let total = 0, failed = [];
     for (const date of dates) {
       // День за днём отдельными посылками: маленький пакет доезжает надёжнее,
-      // и один неудачный день не тянет за собой остальные.
-      const r = await runForDate(date, p.office, p.pvz, log);
+      // и один неудачный день не тянет за собой остальные. Кэш дня игнорируем —
+      // иначе потерянные дни вернут 0, см. комментарий в runForDate.
+      const r = await runForDate(date, p.office, p.pvz, log, true);
       if (r.count && !r.sent) failed.push(date); else total += r.count || 0;
     }
     log(failed.length ? `⚠️ Не отправились дни: ${failed.join(', ')}` : '✅ Период добран целиком');
