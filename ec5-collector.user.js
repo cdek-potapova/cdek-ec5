@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.8.0
+// @version      0.9.0
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -70,19 +70,32 @@
   const loadSeen = (d) => { try { return new Set(JSON.parse(localStorage.getItem(seenKey(d)) || '[]')); } catch (e) { return new Set(); } };
   const saveSeen = (d, s) => { try { localStorage.setItem(seenKey(d), JSON.stringify([...s])); } catch (e) {} };
 
+  // Тело ответа возвращаем всегда (обрезанное): без него причину падения отправки
+  // не видно — а именно она нужна, чтобы понять, почему точка молчит.
+  const cut = (s) => String(s == null ? '' : s).slice(0, 200).replace(/\s+/g, ' ').trim();
   function http(method, url, body) {
     const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Auth-Token': token(), 'X-User-Locale': 'ru' };
     if (typeof GM_xmlhttpRequest === 'function') {
       return new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
-          method, url, headers, data: body ? JSON.stringify(body) : undefined,
-          onload: (r) => { try { resolve({ status: r.status, json: JSON.parse(r.responseText) }); } catch (e) { resolve({ status: r.status, json: null }); } },
-          onerror: (e) => reject(new Error('net ' + (e && e.error))),
+          method, url, headers, data: body ? JSON.stringify(body) : undefined, timeout: 120000,
+          onload: (r) => {
+            let json = null;
+            try { json = JSON.parse(r.responseText); } catch (e) { /* не JSON — отдадим текстом */ }
+            resolve({ status: r.status, json, text: cut(r.responseText) });
+          },
+          onerror: (e) => reject(new Error('сеть: ' + (cut(e && (e.error || e.statusText)) || 'запрос отклонён'))),
+          ontimeout: () => reject(new Error('таймаут (120с)')),
         });
       });
     }
     return fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined })
-      .then(async (r) => ({ status: r.status, json: await r.json().catch(() => null) }));
+      .then(async (r) => {
+        const text = await r.text().catch(() => '');
+        let json = null;
+        try { json = JSON.parse(text); } catch (e) { /* не JSON */ }
+        return { status: r.status, json, text: cut(text) };
+      });
   }
   const LIST = () => CONFIG.GATEWAY + '/order/web/journal/getFilterData';
   const CARD = () => CONFIG.GATEWAY + '/order/web/order/getByNumber';
@@ -186,58 +199,134 @@
     };
   }
 
-  async function collectSide(label, role, listFields, pvz, seen, log) {
-    const recs = (await listSide(listFields, todayDDMMYYYY(), todayDDMMYYYY(), label, log)).filter((it) => !seen.has(it.orderNumber));
+  // Возвращает { rows, raw, dropped }: raw — сколько заказов было в журнале за дату,
+  // dropped — сколько выброшено из-за скрытого телефона (признак «это не наш офис»).
+  async function collectSide(label, role, listFields, pvz, seen, log, date) {
+    const recs = (await listSide(listFields, date, date, label, log)).filter((it) => !seen.has(it.orderNumber));
     log(`${label}: новых ${recs.length}`);
-    if (!recs.length) return [];
+    if (!recs.length) return { rows: [], raw: 0, dropped: 0 };
     let done = 0;
-    const rows = await pool(recs, async (it) => {
+    const out = await pool(recs, async (it) => {
       const row = await enrichRow(it, role, pvz); seen.add(it.orderNumber);
       if (++done % 200 === 0) log(`${label}: ${done}/${recs.length}`);
       return row;
     }, CONFIG.CONCURRENCY);
     // оставляем строки с реальным телефоном клиента (= свой офис)
-    return rows.filter(Boolean).filter((r) => realPhone(r.phone));
+    const got = out.filter(Boolean);
+    const rows = got.filter((r) => realPhone(r.phone));
+    const dropped = got.length - rows.length;
+    if (dropped) log(`${label}: отброшено ${dropped} (телефон скрыт — чужой офис)`);
+    return { rows, raw: recs.length, dropped };
   }
 
-  async function run(log) {
-    if (!token()) { log('❌ Не вижу вход в EC5. Откройте/обновите EC5.'); return { ok: false, reason: 'no-login' }; }
+  // Сбор и отправка за ОДНУ дату (dd.MM.yyyy) для уже определённого офиса.
+  async function runForDate(date, office, pvz, log) {
     const t0 = Date.now();
-    const date = todayDDMMYYYY();
     const seen = loadSeen(date);
+    let all = [], raw = 0, dropped = 0;
 
-    const office = await detectOffice(log);
-    if (!office) { log('❌ Не удалось определить офис аккаунта'); return { ok: false, reason: 'no-office' }; }
-    const pvz = PVZ_NAMES[office.code] || office.name || office.code;
-    log(`Офис аккаунта: ${pvz} (${office.code})`);
-
-    let all = [];
     // 1) ОТПРАВИТЕЛИ (физики-лиды) — оформлено нашим ПВЗ
     try {
-      all = all.concat(await collectSide('Отправители (оформление)', 'отправитель',
-        { field: 'orderFromMyOfficeFlag', value: true, values: null }, pvz, seen, log));
-      saveSeen(date, seen);
+      const s = await collectSide('Отправители (оформление)', 'отправитель',
+        { field: 'orderFromMyOfficeFlag', value: true, values: null }, pvz, seen, log, date);
+      all = all.concat(s.rows); raw += s.raw; dropped += s.dropped;
     } catch (e) { log('Отправители: ошибка ' + (e && e.message)); }
     // 2) ПОЛУЧАТЕЛИ (выдача, в т.ч. договорники) — receiverOffice = наш офис
     try {
-      all = all.concat(await collectSide('Получатели (выдача)', 'получатель',
-        { field: 'receiverOffice', value: null, values: [office.code] }, pvz, seen, log));
-      saveSeen(date, seen);
+      const s = await collectSide('Получатели (выдача)', 'получатель',
+        { field: 'receiverOffice', value: null, values: [office.code] }, pvz, seen, log, date);
+      all = all.concat(s.rows); raw += s.raw; dropped += s.dropped;
     } catch (e) { log('Получатели: ошибка ' + (e && e.message)); }
+    // seen НЕ сохраняем здесь: если отправка не пройдёт, день должен собраться заново
 
     const leads = all.filter((r) => r.orderType === 'Доставка' && r.dogovor === 'нет').length;
     const secs = Math.round((Date.now() - t0) / 1000);
-    log(`Итого новых: ${all.length} за ${secs}с. Из них физиков без договора (лиды): ${leads}.`);
-    if (!all.length) return { ok: true, count: 0 };
+    log(`${date}: к отправке ${all.length} из ${raw} за ${secs}с (лидов ${leads})`);
 
-    const payload = { source: 'ec5-traffic-userscript', version: '0.8.0', date, pvz, records: all };
-    let sent = false;
+    if (!all.length) {
+      // Отправлять нечего — терять тоже нечего, кэш сохраняем (иначе повторное
+      // нажатие заново перекачает все карточки за день).
+      saveSeen(date, seen);
+      // Заказы были, но все выброшены по скрытому телефону — это НЕ «всё собрано»,
+      // это чужой офис. Разводим два случая, иначе оператор видит зелёную галку
+      // и не знает, что данные не идут.
+      if (raw > 0 && dropped === raw) {
+        log(`⚠️ Все ${raw} заказов отброшены: телефоны скрыты. Похоже, аккаунт привязан не к ${pvz}.`);
+        return { ok: true, count: 0, date, raw, dropped, reason: 'foreign-office' };
+      }
+      return { ok: true, count: 0, date, raw, dropped };
+    }
+
+    const payload = { source: 'ec5-traffic-userscript', version: '0.9.0', date, pvz, records: all };
+    let sent = false, why = '';
     try {
       const res = await http('POST', CONFIG.INGEST_URL, payload);
-      sent = res.status >= 200 && res.status < 300;
-      log(sent ? `✅ Отправлено в таблицу: ${all.length}` : `⚠️ Таблица ответила ${res.status}`);
-    } catch (e) { log('⚠️ Не достучался до таблицы: ' + (e && e.message)); }
-    return { ok: true, count: all.length, leads, sent };
+      const ok2xx = res.status >= 200 && res.status < 300;
+      // 2xx мало: приёмник на ошибке тоже отвечает 200 с {ok:false}
+      const okBody = !res.json || res.json.ok !== false;
+      sent = ok2xx && okBody;
+      if (sent) log(`✅ Отправлено в таблицу: ${all.length}`);
+      else { why = `HTTP ${res.status}${res.json && res.json.error ? ' / ' + res.json.error : ''} ${res.text || ''}`.trim(); log('⚠️ Таблица не приняла: ' + why); }
+    } catch (e) { why = (e && e.message) || 'неизвестно'; log('⚠️ Не достучался до таблицы: ' + why); }
+
+    // помечаем заказы обработанными ТОЛЬКО после успешной отправки, иначе строки
+    // пропали бы навсегда: кэш бы их проглотил, а в таблицу они не попали
+    if (sent) saveSeen(date, seen);
+    else log(`⚠️ ${date}: данные НЕ сохранены, нажмите кнопку ещё раз.`);
+    return { ok: true, count: all.length, leads, sent, why, date, raw, dropped };
+  }
+
+  // Определяет офис аккаунта; общая часть обычного сбора и добора за период.
+  async function prepare(log) {
+    if (!token()) { log('❌ Не вижу вход в EC5. Откройте/обновите EC5.'); return { reason: 'no-login' }; }
+    const office = await detectOffice(log);
+    if (!office) { log('❌ Не удалось определить офис аккаунта'); return { reason: 'no-office' }; }
+    const pvz = PVZ_NAMES[office.code] || office.name || office.code;
+    log(`Офис аккаунта: ${pvz} (${office.code})`);
+    return { office, pvz };
+  }
+
+  async function run(log) {
+    const p = await prepare(log);
+    if (p.reason) return { ok: false, reason: p.reason };
+    const r = await runForDate(todayDDMMYYYY(), p.office, p.pvz, log);
+    r.pvz = p.pvz;
+    return r;
+  }
+
+  // ---------- Добор за прошлые дни ----------
+  const parseDDMMYYYY = (s) => {
+    const m = /^(\d{2})\.(\d{2})\.(\d{4})$/.exec(String(s || '').trim());
+    if (!m) return null;
+    const d = new Date(+m[3], +m[2] - 1, +m[1]);
+    return (d.getDate() === +m[1] && d.getMonth() === +m[2] - 1) ? d : null;
+  };
+  const fmt = (d) => { const p = (n) => String(n).padStart(2, '0'); return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()}`; };
+  function daysBetween(from, to) {
+    const out = [];
+    for (const d = new Date(from); d <= to; d.setDate(d.getDate() + 1)) out.push(fmt(d));
+    return out;
+  }
+
+  async function runRange(fromStr, toStr, log) {
+    const from = parseDDMMYYYY(fromStr), to = parseDDMMYYYY(toStr);
+    if (!from || !to) { log('❌ Даты в формате ДД.ММ.ГГГГ'); return { ok: false, reason: 'bad-date' }; }
+    if (from > to) { log('❌ Начало периода позже конца'); return { ok: false, reason: 'bad-date' }; }
+    const dates = daysBetween(from, to);
+    if (dates.length > 62) { log(`❌ Слишком длинный период (${dates.length} дн.), берите месяцами`); return { ok: false, reason: 'bad-date' }; }
+
+    const p = await prepare(log);
+    if (p.reason) return { ok: false, reason: p.reason };
+
+    let total = 0, failed = [];
+    for (const date of dates) {
+      // День за днём отдельными посылками: маленький пакет доезжает надёжнее,
+      // и один неудачный день не тянет за собой остальные.
+      const r = await runForDate(date, p.office, p.pvz, log);
+      if (r.count && !r.sent) failed.push(date); else total += r.count || 0;
+    }
+    log(failed.length ? `⚠️ Не отправились дни: ${failed.join(', ')}` : '✅ Период добран целиком');
+    return { ok: true, count: total, range: true, failed, pvz: p.pvz, dates: dates.length };
   }
 
   // ---------- Активация: меню Tampermonkey / Ctrl+Alt+E ----------
@@ -253,24 +342,62 @@
     }
     p.style.display = 'block'; return p;
   }
-  async function activate() {
+  async function activate(worker, title) {
     if (running) return; running = true;
     const p = toastBox(); p.innerHTML = '';
     const head = document.createElement('div'); head.style.cssText = 'font-weight:600;margin-bottom:6px';
-    head.textContent = '📥 Сбор базы за сегодня…';
+    head.textContent = title || '📥 Сбор базы за сегодня…';
     const body = document.createElement('div'); body.style.cssText = 'font:12px/1.5 monospace';
     p.appendChild(head); p.appendChild(body);
     const log = (m) => { body.insertAdjacentHTML('afterbegin', `<div>${m}</div>`); };
-    let res; try { res = await run(log); } catch (e) { res = { ok: false, msg: String(e && e.message || e) }; }
+    let res; try { res = await (worker || run)(log); } catch (e) { res = { ok: false, msg: String(e && e.message || e) }; }
     running = false;
-    if (res && res.ok && res.count > 0) { head.textContent = `✅ Готово: ${res.count} (лидов ${res.leads || 0})`; head.style.color = '#1aa37a'; }
-    else if (res && res.ok) { head.textContent = '✅ Новых нет (уже выгружено)'; head.style.color = '#1aa37a'; }
-    else if (res && res.reason === 'no-login') { head.textContent = '⚠️ Войдите в EC5 и повторите'; head.style.color = '#d9822b'; }
-    else { head.textContent = '⚠️ Не получилось (детали ниже)'; head.style.color = '#d9822b'; }
-    setTimeout(() => { p.style.display = 'none'; }, 12000);
+
+    let good = false;
+    if (res && res.ok && res.range) {
+      if (res.failed && res.failed.length) head.textContent = `⚠️ Добрано ${res.count}, не ушли дни: ${res.failed.join(', ')}`;
+      else { head.textContent = `✅ Добрано ${res.count} за ${res.dates} дн. — ${res.pvz || ''}`; good = true; }
+    } else if (res && res.ok && res.count > 0 && res.sent === false) {
+      head.textContent = `⚠️ Собрано ${res.count}, НО В ТАБЛИЦУ НЕ УШЛО`;
+    } else if (res && res.ok && res.count > 0) {
+      head.textContent = `✅ Готово: ${res.count} — ${res.pvz || ''} (лидов ${res.leads || 0})`; good = true;
+    } else if (res && res.reason === 'foreign-office') {
+      head.textContent = `⚠️ Ни одной строки: аккаунт не привязан к ${res.pvz || 'этому ПВЗ'}`;
+    } else if (res && res.ok && res.raw === 0) {
+      head.textContent = '✅ Новых нет (уже выгружено)'; good = true;
+    } else if (res && res.ok) {
+      head.textContent = '⚠️ Собрано 0 строк — покажите этот экран Артёму';
+    } else if (res && res.reason === 'no-login') {
+      head.textContent = '⚠️ Войдите в EC5 и повторите';
+    } else {
+      head.textContent = '⚠️ Не получилось (детали ниже)';
+    }
+    head.style.color = good ? '#1aa37a' : '#d9822b';
+    // Окно с ошибкой НЕ прячем: его надо успеть прочитать и сфотографировать.
+    if (good) setTimeout(() => { p.style.display = 'none'; }, 12000);
+    else {
+      const close = document.createElement('div');
+      close.style.cssText = 'margin-top:8px;cursor:pointer;color:#666;font:12px sans-serif';
+      close.textContent = '✕ закрыть';
+      close.onclick = () => { p.style.display = 'none'; };
+      p.appendChild(close);
+    }
   }
 
-  if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand('📥 Собрать базу за сегодня', activate);
+  // Добор за прошлые дни: спрашиваем период и идём по дням.
+  function activateRange() {
+    if (running) return;
+    const from = prompt('Добор базы за период.\n\nНачало (ДД.ММ.ГГГГ):', '');
+    if (!from) return;
+    const to = prompt('Конец (ДД.ММ.ГГГГ):', from);
+    if (!to) return;
+    activate((log) => runRange(from, to, log), `📅 Добор за ${from} — ${to}…`);
+  }
+
+  if (typeof GM_registerMenuCommand === 'function') {
+    GM_registerMenuCommand('📥 Собрать базу за сегодня', () => activate());
+    GM_registerMenuCommand('📅 Добрать за прошлые дни', activateRange);
+  }
   window.addEventListener('keydown', (e) => { if (e.ctrlKey && e.altKey && e.code === 'KeyE') { e.preventDefault(); activate(); } });
-  window.__ec5traffic = { run: activate, CONFIG };
+  window.__ec5traffic = { run: activate, runRange, CONFIG };
 })();
