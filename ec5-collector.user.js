@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.1
+// @version      0.9.2
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -10,8 +10,9 @@
 // @connect      gateway.cdek.ru
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
-// @downloadURL  https://raw.githubusercontent.com/Newcom12/cdek-ec5/main/ec5-collector.user.js
-// @updateURL    https://raw.githubusercontent.com/Newcom12/cdek-ec5/main/ec5-collector.user.js
+// @connect      5.42.124.252
+// @downloadURL  https://raw.githubusercontent.com/cdek-potapova/cdek-ec5/main/ec5-collector.user.js
+// @updateURL    https://raw.githubusercontent.com/cdek-potapova/cdek-ec5/main/ec5-collector.user.js
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -37,6 +38,9 @@
   const CONFIG = {
     GATEWAY: 'https://gateway.cdek.ru',
     INGEST_URL: 'https://script.google.com/macros/s/AKfycbwjkZZyWqF1Xt9TrpgF29bGE8klRrAhxQPzONPTh2AcGnG7ztYObcvYLVNphXreqXwwLw/exec',
+    // Наш приёмник — основной: данные ложатся в базу на сервере и уже оттуда
+    // публикуются в таблицу. Google остаётся вторым адресатом.
+    OURS_URL: 'http://5.42.124.252/ec5-traffic',
     PAGE_LIMIT: 100,
     MAX_PER_SIDE: 50000,     // практически без потолка
     CONCURRENCY: 10,         // параллельных getByNumber
@@ -261,7 +265,20 @@
       return { ok: true, count: 0, date, raw, dropped };
     }
 
-    const payload = { source: 'ec5-traffic-userscript', version: '0.9.1', date, pvz, records: all };
+    const payload = { source: 'ec5-traffic-userscript', version: '0.9.2', date, pvz, records: all };
+
+    // 1) НАШ СЕРВЕР — главный адресат. Пока пакет здесь, данные не потеряются.
+    let savedOurs = false;
+    try {
+      const r0 = await http('POST', CONFIG.OURS_URL, payload);
+      savedOurs = r0.status >= 200 && r0.status < 300 && (!r0.json || r0.json.ok !== false);
+      log(savedOurs ? `✅ Сохранено на сервере: ${all.length}`
+                    : `⚠️ Сервер не принял: HTTP ${r0.status}`);
+    } catch (e) {
+      log('⚠️ Не достучался до сервера: ' + ((e && e.message) || 'неизвестно'));
+    }
+
+    // 2) Google-таблица — вторым заходом.
     let sent = false, why = '';
     try {
       const res = await http('POST', CONFIG.INGEST_URL, payload);
