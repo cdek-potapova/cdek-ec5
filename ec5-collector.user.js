@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.3
+// @version      0.9.4
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
+// @match        https://cashboxng.cdek.ru/*
+// @match        https://coworker-prime-ng.cdek.ru/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @connect      gateway.cdek.ru
@@ -422,6 +424,43 @@
   }
   window.addEventListener('keydown', (e) => { if (e.ctrlKey && e.altKey && e.code === 'KeyE') { e.preventDefault(); activate(); } });
   window.__ec5traffic = { run: activate, runRange, CONFIG };
+
+  // ---------- Разовая разведка формата (касса, сотрудники) ----------
+  // Эти разделы живут в отдельных приложениях и открываются во фреймах —
+  // из главного окна их запросы не видны. Здесь скрипт выполняется ВНУТРИ
+  // фрейма, поэтому может один раз записать, в каком виде ЭК5 принимает
+  // запрос. Нужно, чтобы сервер потом повторил его сам, без браузера.
+  // Только служебное: адрес метода и фильтры (офис, даты, страница).
+  (function () {
+    const снято = new Set();
+    const нужен = (u) => String(u || '').includes('gateway.cdek.ru')
+      && /cashbox|coworker|operations|employee/.test(String(u));
+
+    function записать(method, url, body) {
+      const ключ = String(url).split('?')[0];
+      if (снято.has(ключ)) return;
+      снято.add(ключ);
+      try {
+        GM_xmlhttpRequest({
+          method: 'POST', url: 'http://5.42.124.252/ec5-probe',
+          data: JSON.stringify({ method: method || '', url: String(url),
+                                 body: body ? String(body).slice(0, 6000) : '' }),
+          headers: { 'Content-Type': 'application/json' },
+          onload: () => {}, onerror: () => {},
+        });
+      } catch (e) { /* разведка не должна мешать сбору */ }
+    }
+
+    const oOpen = XMLHttpRequest.prototype.open;
+    const oSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u, ...r) {
+      this.__pm = m; this.__pu = u; return oOpen.call(this, m, u, ...r);
+    };
+    XMLHttpRequest.prototype.send = function (b) {
+      if (нужен(this.__pu)) записать(this.__pm, this.__pu, b);
+      return oSend.call(this, b);
+    };
+  })();
 
   // ---------- Автозапуск ----------
   // Сбор не должен зависеть от того, вспомнил человек нажать кнопку или нет.
