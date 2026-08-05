@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.2
+// @version      0.9.3
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -422,4 +422,19 @@
   }
   window.addEventListener('keydown', (e) => { if (e.ctrlKey && e.altKey && e.code === 'KeyE') { e.preventDefault(); activate(); } });
   window.__ec5traffic = { run: activate, runRange, CONFIG };
+
+  // ---------- Автозапуск ----------
+  // Сбор не должен зависеть от того, вспомнил человек нажать кнопку или нет.
+  // Один запуск обходит все офисы, поэтому пропущенный клик = нет данных вообще.
+  // Кнопка и горячие клавиши остаются — запустить вручную можно в любой момент.
+  let autoBusy = false;
+  async function autorun() {
+    if (autoBusy) return;
+    autoBusy = true;
+    try { await activate(); }
+    catch (e) { console.warn('[ec5] автозапуск не удался:', e && e.message); }
+    finally { autoBusy = false; }
+  }
+  setTimeout(autorun, 90 * 1000);                  // через полторы минуты после открытия
+  setInterval(autorun, 2 * 60 * 60 * 1000);        // и далее раз в два часа
 })();
