@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.4
+// @version      0.9.5
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -462,6 +462,22 @@
     };
   })();
 
+  // ---------- Пульс-сердцебиение ----------
+  // «Сборщик жив»: при автозапуске стучимся на сервер, чтобы в pulse.jsonl было
+  // видно, что скрипт ЭТОЙ версии реально крутится на ПК точки — независимо от
+  // того, собрались данные или нет. Fire-and-forget: сбор не трогает и не роняет.
+  function pulse(event, pvz, rows) {
+    try {
+      GM_xmlhttpRequest({
+        method: 'POST', url: 'http://5.42.124.252/ec5-pulse',
+        data: JSON.stringify({ event: event || '', pvz: pvz || '', rows: rows || 0,
+                               host: location.hostname || '', ver: '0.9.5', note: '' }),
+        headers: { 'Content-Type': 'application/json' },
+        onload: () => {}, onerror: () => {},
+      });
+    } catch (e) { /* пульс не должен мешать сбору */ }
+  }
+
   // ---------- Автозапуск ----------
   // Сбор не должен зависеть от того, вспомнил человек нажать кнопку или нет.
   // Один запуск обходит все офисы, поэтому пропущенный клик = нет данных вообще.
@@ -470,6 +486,7 @@
   async function autorun() {
     if (autoBusy) return;
     autoBusy = true;
+    pulse('autorun', '', 0);
     try { await activate(); }
     catch (e) { console.warn('[ec5] автозапуск не удался:', e && e.message); }
     finally { autoBusy = false; }
