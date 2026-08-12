@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 Касса — сверка выручки по операторам
 // @namespace    cdek.maria.kassa
-// @version      0.2.0
+// @version      0.3.0
 // @description  На закрытии смены снимает выручку по операторам (нал/безнал) из кассы ЭК5 и шлёт на наш сервер для сверки с ручным вводом в РНП. НЕ пишет в РНП. Только Садовод-1 (MSK548).
 // @match        https://cashboxng.cdek.ru/*
 // @grant        GM_xmlhttpRequest
@@ -39,8 +39,15 @@
      сервер такую смену НЕ сверяет (неполная выручка Марии хуже отсутствия сверки).
      Открытый риск: maxAvailableCount:50 — если это жёсткий потолок, смены >50 операций
      не долистаются; тогда incomplete=true и поймаем сигналом, а не тихо.
-   - ВОЗВРАТ: структура операции возврата вживую не снята → смену с возврат/сторно/отмена
-     помечаем hasReturn=true, сервер сверку ОТКЛАДЫВАЕТ, а не выдаёт расхождение.
+   - ВОЗВРАТ: структура операции возврата вживую не снята → hasReturn=true + returnOperators
+     (ФИО авторов возвратов). Сверка откладывает ТОЧЕЧНО по этим операторам, а не глушит
+     всю смену (иначе один возврат убивает сигнал по всем за день).
+   - ПУСТАЯ СМЕНА (дырка, найдена кассовой сессией): если между закрытием и снимком успела
+     открыться новая смена, get-filter-data отдаст её пустой → foundCount=0/collected=0/
+     incomplete=false, формально «полно», а по факту не та смена. Ноль против заполненного
+     РНП = гигантское ложное расхождение. Ловим флагом empty=true (сервер откладывает,
+     день снятым НЕ помечаем — ручной повтор ещё может снять правильную). Плюс снимать
+     надо на самом событии закрытия, до открытия новой (сетевой триггер, URL вечером).
 */
 
 (function () {
@@ -55,7 +62,7 @@
     CASH_UUIDS: ['db7420b0-e528-41e7-a81f-1585cfaed4e1'],  // касса MSK548, одна (подтв.)
     OPS_LIMIT: 100,
     PAGE_HARD_CAP: 200,     // защита от бесконечного листания (макс страниц = cap/limit)
-    VER: '0.2.0',
+    VER: '0.3.0',
   };
 
   const pwt = () => sessionStorage.getItem('pwt') || localStorage.getItem('pwt') || '';
@@ -145,11 +152,17 @@
     for (const v of Object.values(agg)) { v.nal = Math.round(v.nal * 100) / 100; v.beznal = Math.round(v.beznal * 100) / 100; }
     // ЖЁСТКО: собрали меньше, чем заявлено — смена неполная, сверять её нельзя
     const incomplete = collected < foundTotal;
+    // авторы возвратов — чтобы сверка откладывала ТОЧЕЧНО по ним, а не глушила всю смену
+    const returnOperators = [...new Set(diag.vozvrat.map((v) => v.author))];
+    // ПУСТАЯ смена = сняли не ту (между закрытием и снимком открылась новая, пустая).
+    // Ноль при заполненном РНП дал бы Марии гигантское ложное расхождение — не валидна.
+    const empty = collected === 0 || Object.keys(agg).length === 0;
     if (log) {
       log(`смена: операторов ${Object.keys(agg).length}, операций собрано ${collected}/${foundTotal}` +
-          (hasReturn ? ', есть возврат → отложится' : '') + (incomplete ? ' ⚠️ НЕПОЛНАЯ → сигнал' : ''));
+          (hasReturn ? `, возврат у: ${returnOperators.join(', ')}` : '') +
+          (incomplete ? ' ⚠️ НЕПОЛНАЯ → сигнал' : '') + (empty ? ' ⚠️ ПУСТАЯ → вероятно не та смена' : ''));
     }
-    return { perOperator: agg, diagnostics: diag, hasReturn, collected, foundCount: foundTotal, incomplete };
+    return { perOperator: agg, diagnostics: diag, hasReturn, returnOperators, collected, foundCount: foundTotal, incomplete, empty };
   }
 
   const isoDay = () => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
@@ -161,19 +174,23 @@
     const day = isoDay();
     const shift = await collectShift(log);
     if (shift.incomplete) pulse('kassa-incomplete', shift.collected);
+    if (shift.empty) pulse('kassa-empty', 0);
     const payload = { source: 'ec5-kassa-userscript', version: CONFIG.VER, date: day,
       pvz: CONFIG.PVZ_NAME, office: CONFIG.OFFICE_CODE,
-      hasReturn: shift.hasReturn, incomplete: shift.incomplete,
+      hasReturn: shift.hasReturn, returnOperators: shift.returnOperators,
+      incomplete: shift.incomplete, empty: shift.empty,
       collected: shift.collected, foundCount: shift.foundCount,
       perOperator: shift.perOperator, diagnostics: shift.diagnostics };
     let savedOurs = false;
     try {
       const r = await http('POST', CONFIG.OURS_URL, payload);
       savedOurs = r.status >= 200 && r.status < 300 && (!r.json || r.json.ok !== false);
-      log && log(savedOurs ? `✅ смена на сервере (операторов ${Object.keys(shift.perOperator).length})`
+      log && log(savedOurs ? `✅ смена на сервере (операторов ${Object.keys(shift.perOperator).length}${shift.empty ? ', ПУСТАЯ — помечена' : ''})`
                            : `⚠️ сервер не принял: HTTP ${r.status}`);
     } catch (e) { log && log('⚠️ не достучался до сервера: ' + ((e && e.message) || '')); }
-    if (savedOurs) { try { localStorage.setItem(sentKey(day), '1'); } catch (e) {} pulse('kassa-ok', shift.collected); }
+    // помечаем день снятым только при валидной смене: пустую/сомнительную НЕ фиксируем,
+    // чтобы ручной повтор мог снять правильную, пока она ещё «последняя».
+    if (savedOurs && !shift.empty) { try { localStorage.setItem(sentKey(day), '1'); } catch (e) {} pulse('kassa-ok', shift.collected); }
     return savedOurs;
   }
 
