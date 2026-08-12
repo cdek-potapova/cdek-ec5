@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.5
+// @version      0.9.6
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -292,10 +292,13 @@
       else { why = `HTTP ${res.status}${res.json && res.json.error ? ' / ' + res.json.error : ''} ${res.text || ''}`.trim(); log('⚠️ Таблица не приняла: ' + why); }
     } catch (e) { why = (e && e.message) || 'неизвестно'; log('⚠️ Не достучался до таблицы: ' + why); }
 
-    // помечаем заказы обработанными ТОЛЬКО после успешной отправки, иначе строки
-    // пропали бы навсегда: кэш бы их проглотил, а в таблицу они не попали
-    if (sent) saveSeen(date, seen);
-    else log(`⚠️ ${date}: данные НЕ сохранены, нажмите кнопку ещё раз.`);
+    // помечаем заказы обработанными ТОЛЬКО когда их принял КАЖДЫЙ адресат — и наш
+    // сервер, и таблица. Иначе при лежащем сервере (а Google жив) день ушёл бы в
+    // таблицу, пометился обработанным и в нашу базу уже НИКОГДА не попал бы обычным
+    // сбором. Если хоть один не принял — не помечаем, следующий прогон дошлёт;
+    // повтор безопасен, дубли обе стороны отсекают по номеру заказа.
+    if (savedOurs && sent) saveSeen(date, seen);
+    else log(`⚠️ ${date}: принято не всеми (сервер:${savedOurs?'ок':'нет'} таблица:${sent?'ок':'нет'}) — дошлём при следующем сборе.`);
     return { ok: true, count: all.length, leads, sent, why, date, raw, dropped };
   }
 
@@ -471,7 +474,7 @@
       GM_xmlhttpRequest({
         method: 'POST', url: 'http://5.42.124.252/ec5-pulse',
         data: JSON.stringify({ event: event || '', pvz: pvz || '', rows: rows || 0,
-                               host: location.hostname || '', ver: '0.9.5', note: '' }),
+                               host: location.hostname || '', ver: '0.9.6', note: '' }),
         headers: { 'Content-Type': 'application/json' },
         onload: () => {}, onerror: () => {},
       });
