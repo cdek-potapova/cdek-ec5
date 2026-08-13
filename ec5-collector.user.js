@@ -1,16 +1,19 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.7
+// @version      0.9.8
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @connect      gateway.cdek.ru
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
 // @connect      5.42.124.252
+// @connect      superset.cdek.ru
 // @downloadURL  https://raw.githubusercontent.com/cdek-potapova/cdek-ec5/main/ec5-collector.user.js
 // @updateURL    https://raw.githubusercontent.com/cdek-potapova/cdek-ec5/main/ec5-collector.user.js
 // @run-at       document-idle
@@ -51,6 +54,21 @@
 
   // коды офисов -> человеческие имена листов (если код неизвестен — берём имя офиса из EC5)
   const PVZ_NAMES = { KAM32: 'Фуд-Сити', MSK548: 'Садовод-1', MSK2432: 'Садовод-2', MSK456: 'ТЯК' };
+
+  // ---- Анкета точки: удалённо видно, что живо. installId общий на установку (GM-хранилище
+  //      шарится между всеми origin-инстансами одного скрипта). Страница: 5.42.124.252/status ----
+  const STATUS = { officeName: null, account: null, trafficOkTs: null };
+  const STATUS_URL = 'http://5.42.124.252/ec5-status';
+  function installId() {
+    let id = '';
+    try { id = (GM_getValue && GM_getValue('ec5_installId', '')) || ''; } catch (e) {}
+    if (!id) {
+      id = (self.crypto && crypto.randomUUID) ? crypto.randomUUID()
+           : 'i' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      try { GM_setValue && GM_setValue('ec5_installId', id); } catch (e) {}
+    }
+    return id;
+  }
 
   const todayDDMMYYYY = () => {
     const d = new Date(); const p = (n) => String(n).padStart(2, '0');
@@ -272,6 +290,7 @@
     try {
       const r0 = await http('POST', CONFIG.OURS_URL, payload);
       savedOurs = r0.status >= 200 && r0.status < 300 && (!r0.json || r0.json.ok !== false);
+      if (savedOurs) STATUS.trafficOkTs = new Date().toISOString();
       log(savedOurs ? `✅ Сохранено на сервере: ${all.length}`
                     : `⚠️ Сервер не принял: HTTP ${r0.status}`);
     } catch (e) {
@@ -306,6 +325,7 @@
     const office = await detectOffice(log);
     if (!office) { log('❌ Не удалось определить офис аккаунта'); return { reason: 'no-office' }; }
     const pvz = PVZ_NAMES[office.code] || office.name || office.code;
+    STATUS.officeName = pvz; STATUS.account = (office && office.name) || '';
     log(`Офис аккаунта: ${pvz} (${office.code})`);
     return { office, pvz };
   }
@@ -453,6 +473,41 @@
   // Сбор не должен зависеть от того, вспомнил человек нажать кнопку или нет.
   // Один запуск обходит все офисы, поэтому пропущенный клик = нет данных вообще.
   // Кнопка и горячие клавиши остаются — запустить вручную можно в любой момент.
+  // ---------- Анкета: проба упаковки (Superset) + отправка на сервер ----------
+  // Проверка доступа — честной попыткой получить данные (не по имени): GM_xhr шлёт куки
+  // superset.cdek.ru; у директора сессия есть → 200, у оператора нет → откажет. Тихо.
+  function probeUpack() {
+    return new Promise((resolve) => {
+      try {
+        GM_xmlhttpRequest({ method: 'GET', url: 'https://superset.cdek.ru/api/v1/me/', timeout: 15000,
+          onload: (r) => resolve(r.status >= 200 && r.status < 300
+            ? { state: 'ok', lastOk: new Date().toISOString() }
+            : { state: 'no_access', detail: 'нет доступа (HTTP ' + r.status + ')' }),
+          onerror: () => resolve({ state: 'no_access', detail: 'нет сессии Superset' }),
+          ontimeout: () => resolve({ state: 'error', detail: 'таймаут Superset' }) });
+      } catch (e) { resolve({ state: 'error', detail: (e && e.message) || 'проба не запустилась' }); }
+    });
+  }
+
+  let statusBusy = false;
+  async function reportStatus() {
+    if (statusBusy) return; statusBusy = true;
+    try {
+      const traffic = STATUS.trafficOkTs ? { state: 'ok', lastOk: STATUS.trafficOkTs }
+        : (!token() ? { state: 'error', detail: 'нет входа в ЭК5' } : { state: 'off', detail: 'ещё не собирал' });
+      const upack = await probeUpack();
+      const payload = { installId: installId(), officeName: STATUS.officeName || '',
+        account: STATUS.account || '', version: '0.9.8',
+        blocks: { traffic,
+          sleeping: { state: traffic.state === 'ok' ? 'ok' : 'off', detail: 'серверный отчёт' },
+          kassa: { state: 'off', detail: 'отдельный скрипт кассы' },
+          upack } };
+      GM_xmlhttpRequest({ method: 'POST', url: STATUS_URL, data: JSON.stringify(payload),
+        headers: { 'Content-Type': 'application/json' }, onload: () => {}, onerror: () => {} });
+    } catch (e) { /* анкета не должна мешать сбору */ }
+    finally { statusBusy = false; }
+  }
+
   let autoBusy = false;
   async function autorun() {
     if (autoBusy) return;
@@ -460,8 +515,10 @@
     pulse('autorun', '', 0);
     try { await activate(); }
     catch (e) { console.warn('[ec5] автозапуск не удался:', e && e.message); }
-    finally { autoBusy = false; }
+    finally { autoBusy = false; reportStatus(); }   // после сбора обновляем анкету
   }
   setTimeout(autorun, 90 * 1000);                  // через полторы минуты после открытия
-  setInterval(autorun, 2 * 60 * 60 * 1000);        // и далее раз в два часа
+  setInterval(autorun, 2 * 60 * 60 * 1000);        // сбор — раз в два часа
+  setTimeout(reportStatus, 100 * 1000);            // первая анкета сразу после старта
+  setInterval(reportStatus, 15 * 60 * 1000);       // анкета — каждые 15 минут (лёгкая)
 })();
