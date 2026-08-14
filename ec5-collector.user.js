@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.10
+// @version      0.9.11
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -473,34 +473,52 @@
   // Сбор не должен зависеть от того, вспомнил человек нажать кнопку или нет.
   // Один запуск обходит все офисы, поэтому пропущенный клик = нет данных вообще.
   // Кнопка и горячие клавиши остаются — запустить вручную можно в любой момент.
-  // ---------- Анкета: проба упаковки (Superset) + отправка на сервер ----------
-  // ВАЖНО: 401 на Superset = сессия НЕ ОТКРЫТА в этом браузере, а НЕ «нет прав». Superset
-  // пускает через keycloak из ЭК5 (раздел Big Data); cookie появляется ТОЛЬКО после того, как
-  // человек туда реально зашёл. Доступ у аккаунта точки есть (Артём собирал сам), но оператор
-  // в Big Data не ходит → cookie нет → 401. Молча поднять сессию через XHR нельзя (keycloak-flow
-  // требует настоящей навигации, не фонового запроса), поэтому это НЕ ошибка — «зайдите один раз».
-  // Различаем: 200 = собрано; 401/нет cookie = сессия не открыта (retry); 403 = реально нет прав.
-  function probeUpack() {
+  // ---------- Анкета: проба упаковки (Superset) + АВТО-ПОДЪЁМ сессии ----------
+  // Superset пускает по тому же keycloak, что и вход в ЭК5 (кнопка «Sign In with keycloak»
+  // → /login/keycloak). X-Frame-Options/CSP у Superset пустые (проверено 12.08) → его можно
+  // грузить скрытым фреймом. Поэтому при 401 (сессии нет) СНАЧАЛА пробуем тихо её поднять:
+  // невидимый iframe на /login/keycloak проходит SSO-цепочку, пока жив keycloak оператора
+  // (а он жив всю смену), и cookie ставится сам — БЕЗ пароля и без ручного захода в Big Data.
+  // Best-effort: не вышло (keycloak протух / реально нет прав) — тихо остаётся «не для этой
+  // точки» (норма, серым), ничего не ломаем и никого не тревожим.
+
+  const supGet = (url) => new Promise((resolve) => {
+    GM_xmlhttpRequest({ method: 'GET', url, timeout: 15000,
+      onload: (r) => resolve(r.status), onerror: () => resolve(0), ontimeout: () => resolve(-1) });
+  });
+
+  let supWarmedAt = 0;                                  // троттлинг: не чаще раза в 20 мин
+  function warmupSuperset() {
     return new Promise((resolve) => {
+      if (Date.now() - supWarmedAt < 20 * 60 * 1000) { resolve(false); return; }
+      supWarmedAt = Date.now();
+      let done = false;
+      let ifr;
       try {
-        GM_xmlhttpRequest({ method: 'GET', url: 'https://superset.cdek.ru/api/v1/me/', timeout: 15000,
-          onload: (r) => {
-            if (r.status >= 200 && r.status < 300)
-              resolve({ state: 'ok', lastOk: new Date().toISOString() });
-            // НЕ ОШИБКА: у большинства точек Superset-доступа нет и не должно быть —
-            // упаковка собирается только с директорского аккаунта. Для точки это норма,
-            // не тревога, менеджеру ничего делать не надо. Держим спокойный no_access (серый).
-            else if (r.status === 401)
-              resolve({ state: 'no_access', detail: 'упаковка не для этой точки (норма)' });
-            else if (r.status === 403)
-              resolve({ state: 'no_access', detail: 'упаковка не для этой точки (норма)' });
-            else
-              resolve({ state: 'no_access', detail: 'упаковка не для этой точки (HTTP ' + r.status + ')' });
-          },
-          onerror: () => resolve({ state: 'no_access', detail: 'упаковка не для этой точки (норма)' }),
-          ontimeout: () => resolve({ state: 'error', detail: 'таймаут Superset' }) });
-      } catch (e) { resolve({ state: 'error', detail: (e && e.message) || 'проба не запустилась' }); }
+        ifr = document.createElement('iframe');
+        ifr.style.cssText = 'position:absolute;left:-9999px;width:0;height:0;border:0;visibility:hidden';
+        ifr.src = 'https://superset.cdek.ru/login/keycloak';
+        document.documentElement.appendChild(ifr);
+      } catch (e) { resolve(false); return; }
+      setTimeout(() => {                                // ждём цепочку редиректов SSO, снимаем фрейм
+        if (done) return; done = true;
+        try { ifr.remove(); } catch (e) {}
+        resolve(true);
+      }, 6000);
     });
+  }
+
+  async function probeUpack() {
+    try {
+      let st = await supGet('https://superset.cdek.ru/api/v1/me/');
+      if (st === 401 && (await warmupSuperset()))       // сессии нет — поднимаем тихо и пробуем снова
+        st = await supGet('https://superset.cdek.ru/api/v1/me/');
+      if (st >= 200 && st < 300) return { state: 'ok', lastOk: new Date().toISOString() };
+      if (st === -1) return { state: 'error', detail: 'таймаут Superset' };
+      // НЕ ОШИБКА: у большинства точек Superset-доступа нет и не должно быть (собирается
+      // с директорского аккаунта). Для точки это норма — спокойный серый no_access.
+      return { state: 'no_access', detail: 'упаковка не для этой точки (норма)' };
+    } catch (e) { return { state: 'error', detail: (e && e.message) || 'проба не запустилась' }; }
   }
 
   let statusBusy = false;
@@ -511,7 +529,7 @@
         : (!token() ? { state: 'error', detail: 'нет входа в ЭК5' } : { state: 'off', detail: 'ещё не собирал' });
       const upack = await probeUpack();
       const payload = { installId: installId(), officeName: STATUS.officeName || '',
-        account: STATUS.account || '', version: '0.9.10',
+        account: STATUS.account || '', version: '0.9.11',
         blocks: { traffic,
           sleeping: { state: traffic.state === 'ok' ? 'ok' : 'off', detail: 'серверный отчёт' },
           kassa: { state: 'off', detail: 'отдельный скрипт кассы' },
