@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.8
+// @version      0.9.9
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -474,16 +474,27 @@
   // Один запуск обходит все офисы, поэтому пропущенный клик = нет данных вообще.
   // Кнопка и горячие клавиши остаются — запустить вручную можно в любой момент.
   // ---------- Анкета: проба упаковки (Superset) + отправка на сервер ----------
-  // Проверка доступа — честной попыткой получить данные (не по имени): GM_xhr шлёт куки
-  // superset.cdek.ru; у директора сессия есть → 200, у оператора нет → откажет. Тихо.
+  // ВАЖНО: 401 на Superset = сессия НЕ ОТКРЫТА в этом браузере, а НЕ «нет прав». Superset
+  // пускает через keycloak из ЭК5 (раздел Big Data); cookie появляется ТОЛЬКО после того, как
+  // человек туда реально зашёл. Доступ у аккаунта точки есть (Артём собирал сам), но оператор
+  // в Big Data не ходит → cookie нет → 401. Молча поднять сессию через XHR нельзя (keycloak-flow
+  // требует настоящей навигации, не фонового запроса), поэтому это НЕ ошибка — «зайдите один раз».
+  // Различаем: 200 = собрано; 401/нет cookie = сессия не открыта (retry); 403 = реально нет прав.
   function probeUpack() {
     return new Promise((resolve) => {
       try {
         GM_xmlhttpRequest({ method: 'GET', url: 'https://superset.cdek.ru/api/v1/me/', timeout: 15000,
-          onload: (r) => resolve(r.status >= 200 && r.status < 300
-            ? { state: 'ok', lastOk: new Date().toISOString() }
-            : { state: 'no_access', detail: 'нет доступа (HTTP ' + r.status + ')' }),
-          onerror: () => resolve({ state: 'no_access', detail: 'нет сессии Superset' }),
+          onload: (r) => {
+            if (r.status >= 200 && r.status < 300)
+              resolve({ state: 'ok', lastOk: new Date().toISOString() });
+            else if (r.status === 401)
+              resolve({ state: 'no_session', detail: 'Superset не открыт — зайдите в Big Data в ЭК5 один раз (доступ у аккаунта есть)' });
+            else if (r.status === 403)
+              resolve({ state: 'no_access', detail: 'нет прав в Superset (роль аккаунта) — нужен доступ' });
+            else
+              resolve({ state: 'error', detail: 'Superset ответил HTTP ' + r.status });
+          },
+          onerror: () => resolve({ state: 'no_session', detail: 'нет сессии Superset — зайдите в Big Data в ЭК5 один раз' }),
           ontimeout: () => resolve({ state: 'error', detail: 'таймаут Superset' }) });
       } catch (e) { resolve({ state: 'error', detail: (e && e.message) || 'проба не запустилась' }); }
     });
@@ -497,7 +508,7 @@
         : (!token() ? { state: 'error', detail: 'нет входа в ЭК5' } : { state: 'off', detail: 'ещё не собирал' });
       const upack = await probeUpack();
       const payload = { installId: installId(), officeName: STATUS.officeName || '',
-        account: STATUS.account || '', version: '0.9.8',
+        account: STATUS.account || '', version: '0.9.9',
         blocks: { traffic,
           sleeping: { state: traffic.state === 'ok' ? 'ok' : 'off', detail: 'серверный отчёт' },
           kassa: { state: 'off', detail: 'отдельный скрипт кассы' },
