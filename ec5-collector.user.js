@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.9
+// @version      0.9.10
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -487,14 +487,17 @@
           onload: (r) => {
             if (r.status >= 200 && r.status < 300)
               resolve({ state: 'ok', lastOk: new Date().toISOString() });
+            // НЕ ОШИБКА: у большинства точек Superset-доступа нет и не должно быть —
+            // упаковка собирается только с директорского аккаунта. Для точки это норма,
+            // не тревога, менеджеру ничего делать не надо. Держим спокойный no_access (серый).
             else if (r.status === 401)
-              resolve({ state: 'no_session', detail: 'Superset не открыт — зайдите в Big Data в ЭК5 один раз (доступ у аккаунта есть)' });
+              resolve({ state: 'no_access', detail: 'упаковка не для этой точки (норма)' });
             else if (r.status === 403)
-              resolve({ state: 'no_access', detail: 'нет прав в Superset (роль аккаунта) — нужен доступ' });
+              resolve({ state: 'no_access', detail: 'упаковка не для этой точки (норма)' });
             else
-              resolve({ state: 'error', detail: 'Superset ответил HTTP ' + r.status });
+              resolve({ state: 'no_access', detail: 'упаковка не для этой точки (HTTP ' + r.status + ')' });
           },
-          onerror: () => resolve({ state: 'no_session', detail: 'нет сессии Superset — зайдите в Big Data в ЭК5 один раз' }),
+          onerror: () => resolve({ state: 'no_access', detail: 'упаковка не для этой точки (норма)' }),
           ontimeout: () => resolve({ state: 'error', detail: 'таймаут Superset' }) });
       } catch (e) { resolve({ state: 'error', detail: (e && e.message) || 'проба не запустилась' }); }
     });
@@ -508,7 +511,7 @@
         : (!token() ? { state: 'error', detail: 'нет входа в ЭК5' } : { state: 'off', detail: 'ещё не собирал' });
       const upack = await probeUpack();
       const payload = { installId: installId(), officeName: STATUS.officeName || '',
-        account: STATUS.account || '', version: '0.9.9',
+        account: STATUS.account || '', version: '0.9.10',
         blocks: { traffic,
           sleeping: { state: traffic.state === 'ok' ? 'ok' : 'off', detail: 'серверный отчёт' },
           kassa: { state: 'off', detail: 'отдельный скрипт кассы' },
