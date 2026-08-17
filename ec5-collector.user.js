@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.12
+// @version      0.9.13
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -532,7 +532,7 @@
         : (!token() ? { state: 'error', detail: 'нет входа в ЭК5' } : { state: 'off', detail: 'ещё не собирал' });
       const upack = await probeUpack();
       const payload = { installId: installId(), officeName: STATUS.officeName || '',
-        account: STATUS.account || '', version: '0.9.12',
+        account: STATUS.account || '', version: '0.9.13',
         blocks: { traffic,
           sleeping: { state: traffic.state === 'ok' ? 'ok' : 'off', detail: 'серверный отчёт' },
           kassa: { state: 'off', detail: 'отдельный скрипт кассы' },
@@ -748,4 +748,155 @@
   } catch (e) { clog('обсёрвер не стартовал: ' + (e && e.message)); }
 
   pulse('kassa-loaded', 0);   // heartbeat: скрипт установлен и жив на этой точке
+})();
+
+// ===================== БЛОК УПАКОВКИ (влит из vault ec5-upack 0.1.0; сбор Superset -> /ec5-upack) =====================
+(function () {
+  "use strict";
+  if (location.host.indexOf('cashboxng') !== -1) return;  // упаковка — на ek5
+  // --- развязка с трафиком/кассой: свой namespace, свои ключи upack:* ---
+  const SRV = "http://5.42.124.252/ec5-upack";
+  const SUP = "https://superset.cdek.ru";
+  const CODES = ["MSK548", "MSK456", "KAM32", "MSK2432"];
+  const OFF_2701 = "dictGet('bi.dct_company_structure', 'office_name', from_office_uuid)";
+  const OFF_2446 = "dictGet('bi.dct_company_structure', 'office_name', proceed_office_uuid)";
+  const MONTHS = ["", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль",
+                  "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
+  const get = (k) => GM_getValue("upack:" + k, "");
+  const set = (k, v) => GM_setValue("upack:" + k, v);
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const log = (...a) => console.log("[upack]", ...a);
+
+  function gm(method, url, body, headers) {
+    return new Promise((res, rej) => {
+      GM_xmlhttpRequest({
+        method, url, data: body || null,
+        headers: headers || {},
+        onload: (r) => res(r),
+        onerror: () => rej(new Error("net " + url)),
+        ontimeout: () => rej(new Error("timeout " + url)),
+        timeout: 60000,
+      });
+    });
+  }
+
+  async function supQuery(datasetId, columns, metrics, where, timeRange, csrf) {
+    const body = JSON.stringify({
+      datasource: { id: datasetId, type: "table" },
+      result_format: "json", result_type: "full",
+      queries: [{
+        columns, metrics, filters: [], extras: { where },
+        granularity: "date_value", time_range: timeRange, row_limit: 200, orderby: [],
+      }],
+    });
+    const r = await gm("POST", SUP + "/api/v1/chart/data", body,
+      { "Content-Type": "application/json", "X-CSRFToken": csrf, "Referer": SUP + "/" });
+    if (r.status !== 200) throw new Error("chart/data " + r.status + " " + r.responseText.slice(0, 200));
+    return JSON.parse(r.responseText).result[0].data;
+  }
+
+  async function collect(period, monthKey, timeRange) {
+    log("сбор", period, timeRange);
+    // сессия Superset жива? (тянем csrf; при 401 — не собираем, попробуем в след. заход)
+    const cr = await gm("GET", SUP + "/api/v1/security/csrf_token/", null, { "Referer": SUP + "/" });
+    if (cr.status !== 200) { log("Superset не авторизован (", cr.status, ") — пропуск, зайдите в Superset через ЭК5"); return false; }
+    const csrf = JSON.parse(cr.responseText).result;
+
+    const w2701 = "(" + CODES.map((c) => `${OFF_2701} LIKE '${c}%'`).join(" OR ") + ")";
+    const w2446 = "(" + CODES.map((c) => `${OFF_2446} LIKE '${c}%'`).join(" OR ") + ")";
+
+    const byPvz = await supQuery(2701,
+      [{ expressionType: "SQL", sqlExpression: OFF_2701, label: "office" }],
+      ["Выручка за упаковку", { expressionType: "SQL", sqlExpression: "SUM(cnt_package)", label: "qty" }],
+      w2701, timeRange, csrf);
+    const salesByPvz = {};
+    for (const row of byPvz) {
+      const code = (row.office || "").split(",")[0].trim();
+      if (CODES.includes(code)) salesByPvz[code] = { rub: Math.round(row["Выручка за упаковку"] || 0), qty: row.qty || 0 };
+    }
+
+    const byType = await supQuery(2446, ["ADD_SERVICE_NAME"],
+      ["Выручка, руб", "Кол-во заказов"], w2446, timeRange, csrf);
+    const salesByType = byType.map((r) => ({
+      type: r.ADD_SERVICE_NAME, rub: Math.round(r["Выручка, руб"] || 0), orders: r["Кол-во заказов"] || 0,
+    })).filter((x) => x.type && x.orders > 0);
+
+    const payload = { period, month_key: monthKey, sales_by_pvz: salesByPvz, sales_by_type: salesByType };
+    const pr = await gm("POST", SRV, JSON.stringify(payload), { "Content-Type": "application/json" });
+    let ok = false; try { ok = pr.status === 200 && JSON.parse(pr.responseText).ok; } catch (e) {}
+    log("приёмник:", pr.status, pr.responseText.slice(0, 160));
+    return ok;   // помечаем снятым ТОЛЬКО при ok (сервер реально опубликовал)
+  }
+
+  async function run() {
+    const now = new Date();
+    const today = iso(now);
+    // --- месячный: после 5-го числа, за прошлый месяц, один раз ---
+    const py = now.getMonth() === 0 ? now.getFullYear() - 1 : now.getFullYear();
+    const pm = now.getMonth() === 0 ? 12 : now.getMonth(); // 1..12, прошлый месяц
+    const prevKey = `${py}-${String(pm).padStart(2, "0")}`;
+    if (now.getDate() >= 5 && get("lastMonthly") !== prevKey) {
+      const start = `${py}-${String(pm).padStart(2, "0")}-01`;
+      const end = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
+      try {
+        if (await collect(`${MONTHS[pm]} ${py}`, prevKey, `${start} : ${end}`)) set("lastMonthly", prevKey);
+      } catch (e) { log("месячный сбой:", e.message); }
+    }
+    // --- недельный: не чаще раза в 7 дней, текущий месяц по сегодня ---
+    const last = get("lastWeekly");
+    const days = last ? (now - new Date(last)) / 86400000 : 999;
+    if (days >= 7) {
+      const y = now.getFullYear(), m = now.getMonth() + 1;
+      const start = `${y}-${String(m).padStart(2, "0")}-01`;
+      const end = iso(new Date(now.getTime() + 86400000)); // включая сегодня
+      try {
+        if (await collect(`${MONTHS[m]} ${y}`, `${y}-${String(m).padStart(2, "0")}`, `${start} : ${end}`)) set("lastWeekly", today);
+      } catch (e) { log("недельный сбой:", e.message); }
+    }
+  }
+
+  // заход в ЭК5 = попытка; сессия Superset подхватывается, т.к. вход в неё идёт из ЭК5
+  setTimeout(run, 130000);
+})();
+
+// ===================== БЛОК СОТРУДНИКОВ (getEmployeeList -> /ec5-employees, раз в сутки) =====================
+(function () {
+  'use strict';
+  if (location.host.indexOf('cashboxng') !== -1) return;   // сотрудники — на ek5/orderec5
+  const SRV = 'http://5.42.124.252/ec5-employees';
+  const U = 'https://gateway.cdek.ru/coworker/web/coworker/v1/employee/getEmployeeList';
+  const OFFICE_UUID = '931dcd8e-4397-4006-ba9c-2a96ae2ee15d';   // MSK548 = Садовод-1 (под Прокофьевым офис ОДИН)
+  const OFFICE_CODE = 'MSK548';
+  const DAYKEY = 'ec5emp:lastrun';
+  const pwt = () => sessionStorage.getItem('pwt') || localStorage.getItem('pwt') || '';
+  const gm = (method, url, data, headers) => new Promise((res) => {
+    GM_xmlhttpRequest({ method, url, data, headers, timeout: 60000,
+      onload: (r) => res({ status: r.status, text: r.responseText }),
+      onerror: () => res({ status: 0, text: '' }), ontimeout: () => res({ status: -1, text: '' }) });
+  });
+  async function list(status) {
+    const body = JSON.stringify({ sort: [], offset: 0, limit: 100,
+      fields: [{ field: 'office', value: null, values: [OFFICE_UUID] },
+               { field: 'status', value: status, values: null }],
+      columns: ['code','fullName','position','structureDepartment','dateIn','dateOut','status'] });
+    const r = await gm('POST', U, body, { 'Content-Type': 'application/json', 'X-Auth-Token': pwt() });
+    if (r.status !== 200) return null;
+    try { return (JSON.parse(r.text).items) || []; } catch (e) { return null; }
+  }
+  async function run() {
+    const today = new Date().toLocaleDateString('ru-RU');
+    try { if (typeof GM_getValue === 'function' && GM_getValue(DAYKEY, '') === today) return; } catch (e) {}
+    if (!pwt()) return;                          // нет сессии — завтра
+    const works = await list('WORKS');
+    if (works === null) return;                 // ошибка/нет сессии — не портим гейт
+    const fired = (await list('FIRED')) || [];  // если значение статуса иное — просто без уволенных (дифф ловит по отсутствию)
+    const emps = works.concat(fired).map((e) => ({
+      office: OFFICE_CODE, code: e.code, fio: e.fullName, dept: e.structureDepartment || '',
+      pos: e.position || '', dateIn: e.dateIn || '', dateOut: e.dateOut || '', status: e.status || '' }));
+    if (!emps.length) return;
+    const pr = await gm('POST', SRV, JSON.stringify({ date: today, office: OFFICE_CODE, source: 'EK5', employees: emps }),
+      { 'Content-Type': 'application/json' });
+    if (pr.status === 200) { try { GM_setValue && GM_setValue(DAYKEY, today); } catch (e) {} }  // гейт только при успехе
+  }
+  setTimeout(run, 120000);   // раз в сутки, через 2 мин после открытия
 })();
