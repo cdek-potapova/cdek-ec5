@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.13
+// @version      0.9.14
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -35,6 +35,21 @@
       phones[0].number, city.cityName, office}, main.payerType. Тип заказа и № договора берём из списка.
   - Авторизация: заголовок X-Auth-Token = sessionStorage.pwt. Дата: orderDateFrom/orderDateTo (dd.MM.yyyy).
 */
+
+/* ---- Токен нашего приёмника (закрыто 18.08.2026) ------------------------
+   Раньше POST /ec5-* принимал что угодно от кого угодно. Теперь сервер ждёт
+   заголовок X-Token. В ИСХОДНИКЕ здесь плейсхолдер, а не секрет: файл лежит
+   в публичном репозитории cdek-potapova/cdek-ec5, туда секрет класть нельзя.
+   Реальный токен подставляет сервер при отдаче файла по ключу в адресе
+   (см. serve.py). Если скрипт поставлен без ключа, здесь останется
+   плейсхолдер — сбор всё равно идёт, потому что IP точки в белом списке. */
+const EC5_POINT_TOKEN = '__EC5_POINT_TOKEN__';
+const EC5_OURS = '5.42.124.252';
+function ec5Headers(url, headers) {
+  const h = Object.assign({}, headers || {});
+  if (typeof url === 'string' && url.indexOf(EC5_OURS) !== -1) h['X-Token'] = EC5_POINT_TOKEN;
+  return h;
+}
 
 (function () {
   'use strict';
@@ -103,7 +118,7 @@
     if (typeof GM_xmlhttpRequest === 'function') {
       return new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
-          method, url, headers, data: body ? JSON.stringify(body) : undefined, timeout: 120000,
+          method, url, headers: ec5Headers(url, headers), data: body ? JSON.stringify(body) : undefined, timeout: 120000,
           onload: (r) => {
             let json = null;
             try { json = JSON.parse(r.responseText); } catch (e) { /* не JSON — отдадим текстом */ }
@@ -114,7 +129,7 @@
         });
       });
     }
-    return fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined })
+    return fetch(url, { method, headers: ec5Headers(url, headers), body: body ? JSON.stringify(body) : undefined })
       .then(async (r) => {
         const text = await r.text().catch(() => '');
         let json = null;
@@ -466,7 +481,7 @@
         method: 'POST', url: 'http://5.42.124.252/ec5-pulse',
         data: JSON.stringify({ event: event || '', pvz: pvz || '', rows: rows || 0,
                                host: location.hostname || '', ver: '0.9.7', note: '' }),
-        headers: { 'Content-Type': 'application/json' },
+        headers: ec5Headers('http://5.42.124.252/ec5-pulse', { 'Content-Type': 'application/json' }),
         onload: () => {}, onerror: () => {},
       });
     } catch (e) { /* пульс не должен мешать сбору */ }
@@ -538,7 +553,7 @@
           kassa: { state: 'off', detail: 'отдельный скрипт кассы' },
           upack } };
       GM_xmlhttpRequest({ method: 'POST', url: STATUS_URL, data: JSON.stringify(payload),
-        headers: { 'Content-Type': 'application/json' }, onload: () => {}, onerror: () => {} });
+        headers: ec5Headers(STATUS_URL, { 'Content-Type': 'application/json' }), onload: () => {}, onerror: () => {} });
     } catch (e) { /* анкета не должна мешать сбору */ }
     finally { statusBusy = false; }
   }
@@ -586,14 +601,14 @@
     if (typeof GM_xmlhttpRequest === 'function') {
       return new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
-          method, url, headers, data: body ? JSON.stringify(body) : undefined, timeout: 120000,
+          method, url, headers: ec5Headers(url, headers), data: body ? JSON.stringify(body) : undefined, timeout: 120000,
           onload: (r) => { let j = null; try { j = JSON.parse(r.responseText); } catch (e) {} resolve({ status: r.status, json: j, text: cut(r.responseText) }); },
           onerror: (e) => reject(new Error('сеть: ' + (cut(e && (e.error || e.statusText)) || 'отклонён'))),
           ontimeout: () => reject(new Error('таймаут (120с)')),
         });
       });
     }
-    return fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined })
+    return fetch(url, { method, headers: ec5Headers(url, headers), body: body ? JSON.stringify(body) : undefined })
       .then(async (r) => { const t = await r.text().catch(() => ''); let j = null; try { j = JSON.parse(t); } catch (e) {} return { status: r.status, json: j, text: cut(t) }; });
   }
 
@@ -604,7 +619,7 @@
         method: 'POST', url: CONFIG.PULSE_URL,
         data: JSON.stringify({ event: event || '', pvz: CONFIG.PVZ_NAME, rows: rows || 0,
                                host: location.hostname || '', ver: CONFIG.VER, note: 'kassa' }),
-        headers: { 'Content-Type': 'application/json' }, onload: () => {}, onerror: () => {},
+        headers: ec5Headers(CONFIG.PULSE_URL, { 'Content-Type': 'application/json' }), onload: () => {}, onerror: () => {},
       });
     } catch (e) {}
   }
@@ -771,7 +786,7 @@
     return new Promise((res, rej) => {
       GM_xmlhttpRequest({
         method, url, data: body || null,
-        headers: headers || {},
+        headers: ec5Headers(url, headers),
         onload: (r) => res(r),
         onerror: () => rej(new Error("net " + url)),
         ontimeout: () => rej(new Error("timeout " + url)),
@@ -870,7 +885,7 @@
   const DAYKEY = 'ec5emp:lastrun';
   const pwt = () => sessionStorage.getItem('pwt') || localStorage.getItem('pwt') || '';
   const gm = (method, url, data, headers) => new Promise((res) => {
-    GM_xmlhttpRequest({ method, url, data, headers, timeout: 60000,
+    GM_xmlhttpRequest({ method, url, data, headers: ec5Headers(url, headers), timeout: 60000,
       onload: (r) => res({ status: r.status, text: r.responseText }),
       onerror: () => res({ status: 0, text: '' }), ontimeout: () => res({ status: -1, text: '' }) });
   });
