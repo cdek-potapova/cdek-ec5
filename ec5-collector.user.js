@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.15
+// @version      0.9.16
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -646,7 +646,7 @@ function ec5Headers(url, headers) {
     const agg = {};                 // ФИО -> {nal, beznal, ops}
     const diag = { vozvrat: [], cashOut: [], otherName: [], otherPayType: [] };
     const seen = new Set();
-    let hasReturn = false, foundTotal = 0, collected = 0;
+    let hasReturn = false, foundTotal = 0, collected = 0, shiftDate = null;
 
     for (const cu of CONFIG.CASH_UUIDS) {
       let offset = 0, found = null, pages = 0;
@@ -656,6 +656,7 @@ function ec5Headers(url, headers) {
         if (!page.items.length) break;                 // страница пустая — дальше нет смысла
         for (const it of page.items) {
           if (seen.has(it.code)) continue; seen.add(it.code); collected++;
+          if (!shiftDate && it.creationDate) shiftDate = it.creationDate;
           const detail = await http('GET', CONFIG.KASSA_BASE + 'operations/' + it.code);
           const op = (detail.json || {}).operation || {};
           const a = norm(it.author);
@@ -694,17 +695,19 @@ function ec5Headers(url, headers) {
           (hasReturn ? `, возврат у: ${returnOperators.join(', ')}` : '') +
           (incomplete ? ' ⚠️ НЕПОЛНАЯ → сигнал' : '') + (empty ? ' ⚠️ ПУСТАЯ → вероятно не та смена' : ''));
     }
-    return { perOperator: agg, diagnostics: diag, hasReturn, returnOperators, collected, foundCount: foundTotal, incomplete, empty };
+    return { perOperator: agg, diagnostics: diag, hasReturn, returnOperators, collected, foundCount: foundTotal, incomplete, empty, date: shiftDate };
   }
 
   const isoDay = () => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
   const sentKey = (day) => 'ec5kassa:sent:' + day;
+  const isoFromDDMM = (x) => { const p = String(x || '').split('.'); return (p.length === 3) ? (p[2] + '-' + p[1].padStart(2, '0') + '-' + p[0].padStart(2, '0')) : null; };
 
   // ---------- Отправка: помечаем снятым ТОЛЬКО если сервер принял ----------
   async function sendShift(log) {
     pulse('kassa-run', 0);
-    const day = isoDay();
     const shift = await collectShift(log);
+    const day = isoFromDDMM(shift.date) || isoDay();   // дата СМЕНЫ (по операциям), не «сегодня»
+    try { if (localStorage.getItem(sentKey(day)) === '1') return true; } catch (e) {}
     if (shift.incomplete) pulse('kassa-incomplete', shift.collected);
     if (shift.empty) pulse('kassa-empty', 0);
     const payload = { source: 'ec5-kassa-userscript', version: CONFIG.VER, date: day,
@@ -747,8 +750,6 @@ function ec5Headers(url, headers) {
   }
   async function onClose() {
     if (firing) return;
-    const day = isoDay();
-    try { if (localStorage.getItem(sentKey(day)) === '1') return; } catch (e) {}
     firing = true;
     try { await sendShift(clog); } catch (e) { clog('автоснятие не удалось: ' + (e && e.message)); }
     finally { firing = false; }
@@ -766,6 +767,10 @@ function ec5Headers(url, headers) {
     const mo = new MutationObserver(check);
     mo.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
     check();                              // инициализация состояния
+    // Смена уже закрыта на момент загрузки (оператор открыл cashboxng ПОСЛЕ закрытия) —
+    // снимаем сразу. Дата берётся из операций, дедуп по дате смены: вчерашнюю не примем
+    // за сегодня, сегодняшнюю не заблокируем. Пустую сервер отложит.
+    if (readState() === 'closed') onClose();
   } catch (e) { clog('обсёрвер не стартовал: ' + (e && e.message)); }
 
   pulse('kassa-loaded', 0);   // heartbeat: скрипт установлен и жив на этой точке
