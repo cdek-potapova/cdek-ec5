@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.14
+// @version      0.9.15
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -545,7 +545,13 @@ function ec5Headers(url, headers) {
     try {
       const traffic = STATUS.trafficOkTs ? { state: 'ok', lastOk: STATUS.trafficOkTs }
         : (!token() ? { state: 'error', detail: 'нет входа в ЭК5' } : { state: 'off', detail: 'ещё не собирал' });
-      const upack = await probeUpack();
+      await probeUpack();  // греет сессию Superset (iframe SSO); результат для статуса НЕ используем
+      let upack;
+      const ur = (typeof GM_getValue === 'function') ? GM_getValue('upack:lastResult', '') : '';
+      if (!ur) upack = { state: 'off', detail: 'ещё не собирал' };
+      else { const pp = ur.split('|'); upack = (pp[1] === 'ok')
+               ? { state: 'ok', lastOk: pp[0], detail: 'собрано' }
+               : { state: 'error', detail: (pp.slice(2).join('|') || pp[1]).slice(0, 60) }; }
       const payload = { installId: installId(), officeName: STATUS.officeName || '',
         account: STATUS.account || '', version: '0.9.13',
         blocks: { traffic,
@@ -814,7 +820,7 @@ function ec5Headers(url, headers) {
     log("сбор", period, timeRange);
     // сессия Superset жива? (тянем csrf; при 401 — не собираем, попробуем в след. заход)
     const cr = await gm("GET", SUP + "/api/v1/security/csrf_token/", null, { "Referer": SUP + "/" });
-    if (cr.status !== 200) { log("Superset не авторизован (", cr.status, ") — пропуск, зайдите в Superset через ЭК5"); return false; }
+    if (cr.status !== 200) { log("Superset не авторизован", cr.status); set("lastResult", new Date().toISOString() + "|no_session|Superset " + cr.status + " (нет сессии)"); return false; }
     const csrf = JSON.parse(cr.responseText).result;
 
     const w2701 = "(" + CODES.map((c) => `${OFF_2701} LIKE '${c}%'`).join(" OR ") + ")";
@@ -840,6 +846,7 @@ function ec5Headers(url, headers) {
     const pr = await gm("POST", SRV, JSON.stringify(payload), { "Content-Type": "application/json" });
     let ok = false; try { ok = pr.status === 200 && JSON.parse(pr.responseText).ok; } catch (e) {}
     log("приёмник:", pr.status, pr.responseText.slice(0, 160));
+    set("lastResult", new Date().toISOString() + "|" + (ok ? "ok" : "post" + pr.status) + "|" + (ok ? period : pr.responseText.slice(0, 60)));
     return ok;   // помечаем снятым ТОЛЬКО при ok (сервер реально опубликовал)
   }
 
@@ -855,7 +862,7 @@ function ec5Headers(url, headers) {
       const end = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
       try {
         if (await collect(`${MONTHS[pm]} ${py}`, prevKey, `${start} : ${end}`)) set("lastMonthly", prevKey);
-      } catch (e) { log("месячный сбой:", e.message); }
+      } catch (e) { log("месячный сбой:", e.message); set("lastResult", new Date().toISOString() + "|error|мес: " + (e.message || "").slice(0, 60)); }
     }
     // --- недельный: не чаще раза в 7 дней, текущий месяц по сегодня ---
     const last = get("lastWeekly");
@@ -866,12 +873,20 @@ function ec5Headers(url, headers) {
       const end = iso(new Date(now.getTime() + 86400000)); // включая сегодня
       try {
         if (await collect(`${MONTHS[m]} ${y}`, `${y}-${String(m).padStart(2, "0")}`, `${start} : ${end}`)) set("lastWeekly", today);
-      } catch (e) { log("недельный сбой:", e.message); }
+      } catch (e) { log("недельный сбой:", e.message); set("lastResult", new Date().toISOString() + "|error|нед: " + (e.message || "").slice(0, 60)); }
     }
   }
 
   // заход в ЭК5 = попытка; сессия Superset подхватывается, т.к. вход в неё идёт из ЭК5
   setTimeout(run, 130000);
+  if (typeof GM_registerMenuCommand === 'function') {
+    GM_registerMenuCommand('📦 Снять упаковку (сейчас)', async () => {
+      const now = new Date(), y = now.getFullYear(), m = now.getMonth() + 1;
+      const mk = y + '-' + String(m).padStart(2, '0');
+      try { await collect(MONTHS[m] + ' ' + y, mk, mk + '-01 : ' + iso(new Date(now.getTime() + 86400000))); }
+      catch (e) { set('lastResult', new Date().toISOString() + '|error|ручной: ' + (e.message || '').slice(0, 60)); }
+    });
+  }
 })();
 
 // ===================== БЛОК СОТРУДНИКОВ (getEmployeeList -> /ec5-employees, раз в сутки) =====================
