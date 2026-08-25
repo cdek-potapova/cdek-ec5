@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.17
+// @version      0.9.18
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -551,8 +551,8 @@ function ec5Headers(url, headers) {
       if (!ur) upack = { state: 'off', detail: 'ещё не собирал' };
       else { const pp = ur.split('|'); const stg = pp[1];
              upack = (stg === 'ok') ? { state: 'ok', lastOk: pp[0], detail: 'собрано' }
-               : (stg === 'no_session' || stg === 'no_rights')
-                 ? { state: 'off', detail: (pp.slice(2).join('|') || stg).slice(0, 80) }
+               : (stg === 'no_session' || stg === 'no_rights' || stg === 'waf')
+                 ? { state: 'off', detail: (pp.slice(2).join('|') || stg).slice(0, 90) }
                  : { state: 'error', detail: (pp.slice(2).join('|') || stg).slice(0, 80) }; }
       const payload = { installId: installId(), officeName: STATUS.officeName || '',
         account: STATUS.account || '', version: (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.9.17',
@@ -796,10 +796,20 @@ function ec5Headers(url, headers) {
   const log = (...a) => console.log("[upack]", ...a);
 
   function gm(method, url, body, headers) {
+    const h = Object.assign({}, headers || {});
+    if (typeof url === "string" && url.indexOf(SUP) === 0) {
+      // Браузер-контекст: без этого WAF/Superset отвечает 403 на автоматический запрос.
+      h["Origin"] = SUP;
+      if (!h["Accept"]) h["Accept"] = "application/json, text/plain, */*";
+      h["Sec-Fetch-Site"] = "same-origin";
+      h["Sec-Fetch-Mode"] = "cors";
+      h["Sec-Fetch-Dest"] = "empty";
+      h["X-Requested-With"] = "XMLHttpRequest";
+    }
     return new Promise((res, rej) => {
       GM_xmlhttpRequest({
         method, url, data: body || null,
-        headers: ec5Headers(url, headers),
+        headers: ec5Headers(url, h),
         onload: (r) => res(r),
         onerror: () => rej(new Error("net " + url)),
         ontimeout: () => rej(new Error("timeout " + url)),
@@ -829,12 +839,16 @@ function ec5Headers(url, headers) {
     const cr = await gm("GET", SUP + "/api/v1/security/csrf_token/", null, { "Referer": SUP + "/" });
     if (cr.status !== 200) {
       const me = await gm("GET", SUP + "/api/v1/me/", null, { "Referer": SUP + "/" });
-      const stg = (cr.status === 403) ? "no_rights" : "no_session";
-      const why = (cr.status === 403) ? ("аккаунт без прав к Superset (me=" + me.status + ")")
-                : (cr.status === 401) ? "нет сессии Superset"
-                : ("Superset csrf " + cr.status);
-      log("Superset csrf", cr.status, "me", me.status, cr.responseText.slice(0, 120));
-      set("lastResult", new Date().toISOString() + "|" + stg + "|" + why + " / " + cr.responseText.slice(0, 70).replace(/\|/g, "-"));
+      const rh = (cr.responseHeaders || "") + " " + cr.responseText;
+      const waf = /x-sp-crid|stormwall|__cf|challenge|captcha|Attention Required/i.test(rh);
+      const stg = (cr.status === 403) ? (waf ? "waf" : "no_rights") : "no_session";
+      // Диагностика браузер-vs-GM_xhr: me=401 → cookies/сессия не долетают; me=200 → сессия есть,
+      // 403 именно на сбор (WAF или Origin/CSRF). waf → почти наверняка StormWall режет автозапрос.
+      const why = (cr.status !== 200)
+        ? ("Superset csrf=" + cr.status + " me=" + me.status + (waf ? " WAF-StormWall" : ""))
+        : "ok";
+      log("Superset csrf", cr.status, "me", me.status, "waf", waf, cr.responseText.slice(0, 160));
+      set("lastResult", new Date().toISOString() + "|" + stg + "|" + why + " :: " + cr.responseText.slice(0, 140).replace(/\|/g, "-").replace(/\s+/g, " "));
       return false;
     }
     const csrf = JSON.parse(cr.responseText).result;
