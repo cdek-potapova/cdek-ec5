@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.16
+// @version      0.9.17
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -549,11 +549,13 @@ function ec5Headers(url, headers) {
       let upack;
       const ur = (typeof GM_getValue === 'function') ? GM_getValue('upack:lastResult', '') : '';
       if (!ur) upack = { state: 'off', detail: 'ещё не собирал' };
-      else { const pp = ur.split('|'); upack = (pp[1] === 'ok')
-               ? { state: 'ok', lastOk: pp[0], detail: 'собрано' }
-               : { state: 'error', detail: (pp.slice(2).join('|') || pp[1]).slice(0, 60) }; }
+      else { const pp = ur.split('|'); const stg = pp[1];
+             upack = (stg === 'ok') ? { state: 'ok', lastOk: pp[0], detail: 'собрано' }
+               : (stg === 'no_session' || stg === 'no_rights')
+                 ? { state: 'off', detail: (pp.slice(2).join('|') || stg).slice(0, 80) }
+                 : { state: 'error', detail: (pp.slice(2).join('|') || stg).slice(0, 80) }; }
       const payload = { installId: installId(), officeName: STATUS.officeName || '',
-        account: STATUS.account || '', version: '0.9.13',
+        account: STATUS.account || '', version: (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.9.17',
         blocks: { traffic,
           sleeping: { state: traffic.state === 'ok' ? 'ok' : 'off', detail: 'серверный отчёт' },
           kassa: { state: 'off', detail: 'отдельный скрипт кассы' },
@@ -825,7 +827,16 @@ function ec5Headers(url, headers) {
     log("сбор", period, timeRange);
     // сессия Superset жива? (тянем csrf; при 401 — не собираем, попробуем в след. заход)
     const cr = await gm("GET", SUP + "/api/v1/security/csrf_token/", null, { "Referer": SUP + "/" });
-    if (cr.status !== 200) { log("Superset не авторизован", cr.status); set("lastResult", new Date().toISOString() + "|no_session|Superset " + cr.status + " (нет сессии)"); return false; }
+    if (cr.status !== 200) {
+      const me = await gm("GET", SUP + "/api/v1/me/", null, { "Referer": SUP + "/" });
+      const stg = (cr.status === 403) ? "no_rights" : "no_session";
+      const why = (cr.status === 403) ? ("аккаунт без прав к Superset (me=" + me.status + ")")
+                : (cr.status === 401) ? "нет сессии Superset"
+                : ("Superset csrf " + cr.status);
+      log("Superset csrf", cr.status, "me", me.status, cr.responseText.slice(0, 120));
+      set("lastResult", new Date().toISOString() + "|" + stg + "|" + why + " / " + cr.responseText.slice(0, 70).replace(/\|/g, "-"));
+      return false;
+    }
     const csrf = JSON.parse(cr.responseText).result;
 
     const w2701 = "(" + CODES.map((c) => `${OFF_2701} LIKE '${c}%'`).join(" OR ") + ")";
