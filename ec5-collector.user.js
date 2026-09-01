@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.19
+// @version      0.9.20
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -981,6 +981,20 @@ function ec5Headers(url, headers) {
   const iso = (d) => d.toISOString().slice(0, 10);
   const log = (...a) => console.log("[upack]", ...a);
 
+  // Пульс в /ec5-pulse — чтобы в pulse.jsonl было видно, что сбор упаковки живой
+  // и с какой выручкой (наблюдаемость для сервера/хартбита). Fire-and-forget.
+  function upackPulse(qty, rub, ok) {
+    try {
+      GM_xmlhttpRequest({
+        method: "POST", url: "http://5.42.124.252/ec5-pulse",
+        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.20",
+          host: location.hostname || "", note: (ok ? "ok " : "postfail ") + "rub=" + (rub || 0) }),
+        headers: ec5Headers("http://5.42.124.252/ec5-pulse", { "Content-Type": "application/json" }),
+        onload: () => {}, onerror: () => {},
+      });
+    } catch (e) {}
+  }
+
   function gm(method, url, body, headers) {
     return new Promise((res, rej) => {
       GM_xmlhttpRequest({
@@ -1038,16 +1052,27 @@ function ec5Headers(url, headers) {
       if (CODES.includes(code)) salesByPvz[code] = { rub: Math.round(row["Выручка за упаковку"] || 0), qty: row.qty || 0 };
     }
 
-    const byType = await supQuery(2446, ["ADD_SERVICE_NAME"],
-      ["Выручка, руб", "Кол-во заказов"], w2446, timeRange, csrf);
-    const salesByType = byType.map((r) => ({
-      type: r.ADD_SERVICE_NAME, rub: Math.round(r["Выручка, руб"] || 0), orders: r["Кол-во заказов"] || 0,
-    })).filter((x) => x.type && x.orders > 0);
+    // Разбивка по типам (наценка) — датасет 2446. НЕ верифицирован так же надёжно,
+    // как 2701 (продажи по ПВЗ — главное для Марии). Поэтому best-effort: если 2446
+    // упадёт (нет колонки date_value / сменилось имя метрики / права), НЕ роняем весь
+    // сбор, а шлём хотя бы sales_by_pvz. Наценочная таблица просто будет пустой.
+    let salesByType = [];
+    try {
+      const byType = await supQuery(2446, ["ADD_SERVICE_NAME"],
+        ["Выручка, руб", "Кол-во заказов"], w2446, timeRange, csrf);
+      salesByType = byType.map((r) => ({
+        type: r.ADD_SERVICE_NAME, rub: Math.round(r["Выручка, руб"] || 0), orders: r["Кол-во заказов"] || 0,
+      })).filter((x) => x.type && x.orders > 0);
+    } catch (e) { log("2446 (типы) не собрался, шлём только ПВЗ:", (e && e.message) || e); }
 
     const payload = { period, month_key: monthKey, sales_by_pvz: salesByPvz, sales_by_type: salesByType };
+    let tq = 0, tr = 0;
+    for (const c of CODES) { const d = salesByPvz[c]; if (d) { tq += d.qty || 0; tr += d.rub || 0; } }
+
     const pr = await gm("POST", SRV, JSON.stringify(payload), { "Content-Type": "application/json" });
     let ok = false; try { ok = pr.status === 200 && JSON.parse(pr.responseText).ok; } catch (e) {}
     log("приёмник:", pr.status, pr.responseText.slice(0, 160));
+    upackPulse(tq, tr, ok);
     set("lastResult", new Date().toISOString() + "|" + (ok ? "ok" : "post" + pr.status) + "|" + (ok ? period : pr.responseText.slice(0, 60)));
     return ok;   // помечаем снятым ТОЛЬКО при ok (сервер реально опубликовал)
   }
