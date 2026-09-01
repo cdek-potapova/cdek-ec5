@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.18
+// @version      0.9.19
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -301,7 +301,7 @@ function ec5Headers(url, headers) {
       return { ok: true, count: 0, date, raw, dropped };
     }
 
-    const payload = { source: 'ec5-traffic-userscript', version: '0.9.2', date, pvz, records: all };
+    const payload = { source: 'ec5-traffic-userscript', version: '0.9.18', date, pvz, records: all };
 
     // 1) НАШ СЕРВЕР — главный адресат. Пока пакет здесь, данные не потеряются.
     let savedOurs = false;
@@ -551,8 +551,8 @@ function ec5Headers(url, headers) {
       if (!ur) upack = { state: 'off', detail: 'ещё не собирал' };
       else { const pp = ur.split('|'); const stg = pp[1];
              upack = (stg === 'ok') ? { state: 'ok', lastOk: pp[0], detail: 'собрано' }
-               : (stg === 'no_session' || stg === 'no_rights' || stg === 'waf')
-                 ? { state: 'off', detail: (pp.slice(2).join('|') || stg).slice(0, 90) }
+               : (stg === 'no_session' || stg === 'no_rights')
+                 ? { state: 'off', detail: (pp.slice(2).join('|') || stg).slice(0, 80) }
                  : { state: 'error', detail: (pp.slice(2).join('|') || stg).slice(0, 80) }; }
       const payload = { installId: installId(), officeName: STATUS.officeName || '',
         account: STATUS.account || '', version: (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '0.9.17',
@@ -575,6 +575,13 @@ function ec5Headers(url, headers) {
     catch (e) { console.warn('[ec5] автозапуск не удался:', e && e.message); }
     finally { autoBusy = false; reportStatus(); }   // после сбора обновляем анкету
   }
+  // Мгновенный сигнал при загрузке: без него скрипт молчит первые 100 секунд, и
+  // если вкладку закрыли раньше — на сервере полная тишина, неотличимая от «не
+  // установлен». Именно из-за этого 23-25.08 не могли понять, стоит ли скрипт на
+  // точке Рената. Лёгкий, ничего не собирает.
+  try { pulse('loaded', '', 0); } catch (e) {}
+  setTimeout(reportStatus, 3 * 1000);              // анкета сразу, чтобы точка была видна
+
   setTimeout(autorun, 90 * 1000);                  // через полторы минуты после открытия
   setInterval(autorun, 2 * 60 * 60 * 1000);        // сбор — раз в два часа
   setTimeout(reportStatus, 100 * 1000);            // первая анкета сразу после старта
@@ -591,15 +598,155 @@ function ec5Headers(url, headers) {
     KASSA_BASE: 'https://gateway.cdek.ru/cashbox-operating/web/v1/',
     OURS_URL: 'http://5.42.124.252/ec5-kassa',
     PULSE_URL: 'http://5.42.124.252/ec5-pulse',
+    // ⚠️ Ниже — ФОЛЛБЭК-значения (Садовод-1). С 0.4.0 касса и офис определяются
+    // ДИНАМИЧЕСКИ (см. resolveIdentity). Хардкод остаётся страховкой: если
+    // самоопределение не сработало на Садовод-1 — точка НЕ должна деградировать.
     OFFICE_CODE: 'MSK548',
     PVZ_NAME: 'Садовод-1',
     CASH_UUIDS: ['db7420b0-e528-41e7-a81f-1585cfaed4e1'],  // касса MSK548, одна (подтв.)
     OPS_LIMIT: 100,
     PAGE_HARD_CAP: 200,     // защита от бесконечного листания (макс страниц = cap/limit)
-    VER: '0.3.0',
+    VER: '0.4.0',
   };
 
   const pwt = () => sessionStorage.getItem('pwt') || localStorage.getItem('pwt') || '';
+
+  // ============ САМООПРЕДЕЛЕНИЕ КАССЫ/ОФИСА (0.4.0) ============
+  // Три источника, от надёжного к запасному; всё в try/catch, любой сбой → хардкод.
+  //  1) SNIFF  — пассивно слушаем СОБСТВЕННЫЕ запросы приложения cashboxng
+  //     (fetch/XHR к cashbox-operating). Из тела get-filter-data берём cashUuid,
+  //     который приложение реально использует = касса ЭТОЙ точки. Плюс офис из
+  //     любых полей office*. Самый достоверный сигнал (значения самого приложения).
+  //     Минус: @run-at document-idle → стартовые запросы загрузки могли пройти ДО нас;
+  //     ловим повторные (навигация оператора, наши же обращения этот хук НЕ видит —
+  //     мы ходим через GM_xmlhttpRequest, а он мимо window.fetch/XHR).
+  //  2) PROBE  — активно спрашиваем gateway список касс оператора тем же токеном pwt
+  //     (кандидаты эндпоинтов cash-registers/*). Не зависит от действий оператора.
+  //  3) CONFIG — хардкод Садовод-1 (страховка).
+  const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+  const isUuid = (s) => typeof s === 'string' && UUID_RE.test(s);
+  const detect = { sniff: { uuids: new Set(), code: null, name: null }, probe: null, probed: false };
+
+  // — рекурсивный сборщик: cashUuid'ы и офис из произвольного JSON —
+  //   target — куда складывать {uuids:Set, code, name}. allowUuidName — принимать ли
+  //   пару uuid+name как кассу (ДА для выделенного списка касс из PROBE; НЕТ для
+  //   общего трафика cashbox-operating из SNIFF, где uuid+name может быть НЕ кассой:
+  //   автор операции, документ и т.п. → берём только явный ключ cashUuid).
+  function harvest(node, depth, target, allowUuidName) {
+    if (node == null || depth > 6) return;
+    if (Array.isArray(node)) { for (const v of node) harvest(v, depth + 1, target, allowUuidName); return; }
+    if (typeof node !== 'object') return;
+    // Фильтр-шейп get-filter-data: {field:'cashUuid', value:'<uuid>', values:[...]} —
+    // именно так приложение (и мы) шлём фильтр по кассе. uuid лежит в value/values,
+    // а НЕ в ключе с именем cashUuid. Это самый достоверный сигнал.
+    try {
+      const fn = node.field && String(node.field).toLowerCase();
+      if (fn === 'cashuuid' || fn === 'cashboxuuid') {
+        if (isUuid(node.value)) target.uuids.add(node.value);
+        if (Array.isArray(node.values)) for (const x of node.values) if (isUuid(x)) target.uuids.add(x);
+      }
+    } catch (e) {}
+    for (const k in node) {
+      let v;
+      try { v = node[k]; } catch (e) { continue; }
+      const lk = k.toLowerCase();
+      if ((lk === 'cashuuid' || lk === 'cashboxuuid') && isUuid(v)) target.uuids.add(v);
+      if (allowUuidName && lk === 'uuid' && isUuid(v) && (node.name || node.cashName || node.title)) target.uuids.add(v);
+      if ((lk === 'officecode' || lk === 'office_code') && typeof v === 'string' && v.length <= 16 && !target.code) target.code = v;
+      if ((lk === 'officename' || lk === 'office_name') && typeof v === 'string' && !target.name) target.name = v;
+      if (lk === 'office' && v && typeof v === 'object') {
+        if (!target.code && typeof v.code === 'string' && v.code.length <= 16) target.code = v.code;
+        if (!target.name && typeof v.name === 'string') target.name = v.name;
+      }
+      if (v && typeof v === 'object') harvest(v, depth + 1, target, allowUuidName);
+    }
+  }
+  function sniffText(url, txt) {
+    try {
+      if (!url || String(url).indexOf('cashbox-operating') === -1 || !txt) return;
+      harvest(JSON.parse(txt), 0, detect.sniff, false);
+    } catch (e) {}
+  }
+  // Установка хуков как можно раньше. Пассивно: только читаем, поведение не меняем.
+  try {
+    const of = window.fetch;
+    if (typeof of === 'function' && !of.__ec5k) {
+      const wf = function (input, init) {
+        let url = ''; try { url = (typeof input === 'string') ? input : (input && input.url) || ''; } catch (e) {}
+        try { if (url.indexOf('cashbox-operating') !== -1 && init && init.body && typeof init.body === 'string') sniffText(url, init.body); } catch (e) {}
+        const p = of.apply(this, arguments);
+        try {
+          if (url.indexOf('cashbox-operating') !== -1) p.then((r) => { try { r.clone().text().then((t) => sniffText(url, t)).catch(() => {}); } catch (e) {} }).catch(() => {});
+        } catch (e) {}
+        return p;
+      };
+      wf.__ec5k = true; window.fetch = wf;
+    }
+  } catch (e) {}
+  try {
+    const XP = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+    if (XP && !XP.__ec5k) {
+      const oOpen = XP.open, oSend = XP.send;
+      XP.open = function (m, u) { try { this.__ec5url = u; } catch (e) {} return oOpen.apply(this, arguments); };
+      XP.send = function (body) {
+        try {
+          const u = this.__ec5url || '';
+          if (String(u).indexOf('cashbox-operating') !== -1) {
+            if (typeof body === 'string') sniffText(u, body);
+            this.addEventListener('load', function () { try { sniffText(u, this.responseText); } catch (e) {} });
+          }
+        } catch (e) {}
+        return oSend.apply(this, arguments);
+      };
+      XP.__ec5k = true;
+    }
+  } catch (e) {}
+
+  // — активный опрос списка касс оператора (кандидаты эндпоинтов) —
+  async function runProbe() {
+    const bodies = [
+      { sort: [], offset: 0, limit: 50, fields: [], columns: ['uuid', 'name', 'officeCode', 'officeName'] },
+      { sort: [], offset: 0, limit: 50, fields: [] },
+      { offset: 0, limit: 50 },
+    ];
+    const posts = ['cash-registers/get-filter-data', 'cash-register/get-filter-data', 'cashboxes/get-filter-data'];
+    const gets = ['cash-registers', 'cash-register', 'cashboxes'];
+    const tmp = { uuids: new Set(), code: null, name: null };
+    for (const ep of posts) {
+      for (const b of bodies) {
+        try {
+          const r = await http('POST', CONFIG.KASSA_BASE + ep, b);
+          if (r.status >= 200 && r.status < 300 && r.json) { harvest(r.json, 0, tmp, true); if (tmp.uuids.size) return { uuids: [...tmp.uuids], code: tmp.code, name: tmp.name, ep }; }
+        } catch (e) {}
+      }
+    }
+    for (const ep of gets) {
+      try {
+        const r = await http('GET', CONFIG.KASSA_BASE + ep);
+        if (r.status >= 200 && r.status < 300 && r.json) { harvest(r.json, 0, tmp, true); if (tmp.uuids.size) return { uuids: [...tmp.uuids], code: tmp.code, name: tmp.name, ep }; }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  const uuid8 = (u) => String(u || '').slice(0, 8);
+  // Собирает итог: {cashUuids, officeCode, pvz, source}. Офис всегда РАЗНЫЙ у разных
+  // касс (fallback 'CASH-<uuid8>'), чтобы точки не перетирали друг друга в БД
+  // (ключ kassa_shifts = office+date, ON CONFLICT REPLACE).
+  async function resolveIdentity() {
+    try {
+      if (detect.sniff.uuids.size) {
+        const uu = [...detect.sniff.uuids];
+        return { cashUuids: uu, officeCode: detect.sniff.code || ('CASH-' + uuid8(uu[0])), pvz: detect.sniff.name || detect.sniff.code || ('касса ' + uuid8(uu[0])), source: 'sniff' };
+      }
+      if (!detect.probed) { detect.probed = true; try { detect.probe = await runProbe(); } catch (e) { detect.probe = null; } }
+      if (detect.probe && detect.probe.uuids && detect.probe.uuids.length) {
+        const uu = detect.probe.uuids;
+        return { cashUuids: uu, officeCode: detect.probe.code || ('CASH-' + uuid8(uu[0])), pvz: detect.probe.name || detect.probe.code || ('касса ' + uuid8(uu[0])), source: 'probe' };
+      }
+    } catch (e) {}
+    return { cashUuids: CONFIG.CASH_UUIDS, officeCode: CONFIG.OFFICE_CODE, pvz: CONFIG.PVZ_NAME, source: 'config' };
+  }
   const norm = (a) => String(a).replace(/\s+\d+$/, '').trim();   // «ФИО 6295» -> «ФИО»
   const cut = (s) => String(s == null ? '' : s).slice(0, 200).replace(/\s+/g, ' ').trim();
 
@@ -621,12 +768,17 @@ function ec5Headers(url, headers) {
   }
 
   // ---------- Пульс-сердцебиение (та же механика, что в трафике) ----------
-  function pulse(event, rows) {
+  function pulse(event, rows, detail) {
     try {
+      const body = { event: event || '', pvz: (detail && detail.pvz) || CONFIG.PVZ_NAME, rows: rows || 0,
+                     host: location.hostname || '', ver: CONFIG.VER, note: 'kassa' };
+      if (detail) {
+        if (detail.source) body.source = detail.source;
+        const off = detail.office || detail.officeCode; if (off) body.office = off;
+        const uu = detail.uuids || detail.cashUuids; if (uu) body.uuids = uu;
+      }
       GM_xmlhttpRequest({
-        method: 'POST', url: CONFIG.PULSE_URL,
-        data: JSON.stringify({ event: event || '', pvz: CONFIG.PVZ_NAME, rows: rows || 0,
-                               host: location.hostname || '', ver: CONFIG.VER, note: 'kassa' }),
+        method: 'POST', url: CONFIG.PULSE_URL, data: JSON.stringify(body),
         headers: ec5Headers(CONFIG.PULSE_URL, { 'Content-Type': 'application/json' }), onload: () => {}, onerror: () => {},
       });
     } catch (e) {}
@@ -644,13 +796,13 @@ function ec5Headers(url, headers) {
 
   // ---------- Сбор всей смены с пагинацией + детект неполноты ----------
   // Порт логики из work-hub/tools/ek5-kassa/ek5_kassa_collector.js (спека кассовой сессии).
-  async function collectShift(log) {
+  async function collectShift(log, cashUuids) {
     const agg = {};                 // ФИО -> {nal, beznal, ops}
     const diag = { vozvrat: [], cashOut: [], otherName: [], otherPayType: [] };
     const seen = new Set();
     let hasReturn = false, foundTotal = 0, collected = 0, shiftDate = null;
 
-    for (const cu of CONFIG.CASH_UUIDS) {
+    for (const cu of (cashUuids && cashUuids.length ? cashUuids : CONFIG.CASH_UUIDS)) {
       let offset = 0, found = null, pages = 0;
       do {
         const page = await opsPage(cu, offset);
@@ -704,16 +856,38 @@ function ec5Headers(url, headers) {
   const sentKey = (day) => 'ec5kassa:sent:' + day;
   const isoFromDDMM = (x) => { const p = String(x || '').split('.'); return (p.length === 3) ? (p[2] + '-' + p[1].padStart(2, '0') + '-' + p[0].padStart(2, '0')) : null; };
 
+  // Ждём токен: касса читала rows:0, когда автоснятие срабатывало ДО того, как
+  // приложение положило pwt в sessionStorage (пустой X-Auth-Token → сервер не отдаёт
+  // операции). Даём токену появиться (до ~30с), иначе снимать нечем.
+  async function waitPwt(tries) {
+    for (let i = 0; i < (tries || 15); i++) { if (pwt()) return true; await new Promise((r) => setTimeout(r, 2000)); }
+    return !!pwt();
+  }
+
   // ---------- Отправка: помечаем снятым ТОЛЬКО если сервер принял ----------
   async function sendShift(log) {
     pulse('kassa-run', 0);
-    const shift = await collectShift(log);
+    if (!(await waitPwt(15))) { log && log('⚠️ нет токена pwt — смена не снята, повтор позже'); pulse('kassa-notoken', 0); return false; }
+    const ident = await resolveIdentity();
+    log && log(`касса точки: source=${ident.source}, office=${ident.officeCode}, касс=${ident.cashUuids.length}`);
+    const shift = await collectShift(log, ident.cashUuids);
     const day = isoFromDDMM(shift.date) || isoDay();   // дата СМЕНЫ (по операциям), не «сегодня»
-    try { if (localStorage.getItem(sentKey(day)) === '1') return true; } catch (e) {}
-    if (shift.incomplete) pulse('kassa-incomplete', shift.collected);
-    if (shift.empty) pulse('kassa-empty', 0);
+    // ключ дедупа привязан к офису — чтобы разные точки не гасили снятие друг у друга
+    const key = sentKey(ident.officeCode + ':' + day);
+    try { if (localStorage.getItem(key) === '1') return true; } catch (e) {}
+    if (shift.incomplete) pulse('kassa-incomplete', shift.collected, ident);
+    if (shift.empty) pulse('kassa-empty', 0, ident);
+    // ЗАЩИТА ОТ ПЕРЕТИРАНИЯ ЧУЖОЙ ТОЧКИ: сервер держит одну строку на (office,date)
+    // с ON CONFLICT REPLACE. Если самоопределение не сработало (source=config) и смена
+    // пустая — это, скорее всего, НЕ Садовод-1 (чужой токен к нашей кассе даёт пусто).
+    // Тогда НЕ шлём: иначе пустышка перетрёт настоящую строку Садовода-1 в БД.
+    if (ident.source === 'config' && shift.empty) {
+      log && log('⚠️ хардкод-фоллбэк + пустая смена — не шлю (защита строки Садовод-1)');
+      pulse('kassa-unidentified', 0, ident);
+      return false;
+    }
     const payload = { source: 'ec5-kassa-userscript', version: CONFIG.VER, date: day,
-      pvz: CONFIG.PVZ_NAME, office: CONFIG.OFFICE_CODE,
+      pvz: ident.pvz, office: ident.officeCode, detectSource: ident.source, cashUuids: ident.cashUuids,
       hasReturn: shift.hasReturn, returnOperators: shift.returnOperators,
       incomplete: shift.incomplete, empty: shift.empty,
       collected: shift.collected, foundCount: shift.foundCount,
@@ -727,7 +901,7 @@ function ec5Headers(url, headers) {
     } catch (e) { log && log('⚠️ не достучался до сервера: ' + ((e && e.message) || '')); }
     // помечаем день снятым только при валидной смене: пустую/сомнительную НЕ фиксируем,
     // чтобы ручной повтор мог снять правильную, пока она ещё «последняя».
-    if (savedOurs && !shift.empty) { try { localStorage.setItem(sentKey(day), '1'); } catch (e) {} pulse('kassa-ok', shift.collected); }
+    if (savedOurs && !shift.empty) { try { localStorage.setItem(key, '1'); } catch (e) {} pulse('kassa-ok', shift.collected, ident); }
     return savedOurs;
   }
 
@@ -776,6 +950,18 @@ function ec5Headers(url, headers) {
   } catch (e) { clog('обсёрвер не стартовал: ' + (e && e.message)); }
 
   pulse('kassa-loaded', 0);   // heartbeat: скрипт установлен и жив на этой точке
+
+  // Диагностика самоопределения в pulse.jsonl: даём приложению прогреться и токену
+  // появиться, затем публикуем, ЧТО определили (source/office/кол-во касс). На
+  // следующих прогонах Садовод-1 в pulse.jsonl должно быть событие kassa-detect с
+  // rows>0 (нашли касс) и source=sniff|probe (в идеале) либо config (фоллбэк).
+  setTimeout(async () => {
+    try {
+      await waitPwt(20);
+      const ident = await resolveIdentity();
+      pulse('kassa-detect', (ident.cashUuids || []).length, ident);
+    } catch (e) {}
+  }, 40 * 1000);
 })();
 
 // ===================== БЛОК УПАКОВКИ (влит из vault ec5-upack 0.1.0; сбор Superset -> /ec5-upack) =====================
@@ -796,20 +982,10 @@ function ec5Headers(url, headers) {
   const log = (...a) => console.log("[upack]", ...a);
 
   function gm(method, url, body, headers) {
-    const h = Object.assign({}, headers || {});
-    if (typeof url === "string" && url.indexOf(SUP) === 0) {
-      // Браузер-контекст: без этого WAF/Superset отвечает 403 на автоматический запрос.
-      h["Origin"] = SUP;
-      if (!h["Accept"]) h["Accept"] = "application/json, text/plain, */*";
-      h["Sec-Fetch-Site"] = "same-origin";
-      h["Sec-Fetch-Mode"] = "cors";
-      h["Sec-Fetch-Dest"] = "empty";
-      h["X-Requested-With"] = "XMLHttpRequest";
-    }
     return new Promise((res, rej) => {
       GM_xmlhttpRequest({
         method, url, data: body || null,
-        headers: ec5Headers(url, h),
+        headers: ec5Headers(url, headers),
         onload: (r) => res(r),
         onerror: () => rej(new Error("net " + url)),
         ontimeout: () => rej(new Error("timeout " + url)),
@@ -839,16 +1015,12 @@ function ec5Headers(url, headers) {
     const cr = await gm("GET", SUP + "/api/v1/security/csrf_token/", null, { "Referer": SUP + "/" });
     if (cr.status !== 200) {
       const me = await gm("GET", SUP + "/api/v1/me/", null, { "Referer": SUP + "/" });
-      const rh = (cr.responseHeaders || "") + " " + cr.responseText;
-      const waf = /x-sp-crid|stormwall|__cf|challenge|captcha|Attention Required/i.test(rh);
-      const stg = (cr.status === 403) ? (waf ? "waf" : "no_rights") : "no_session";
-      // Диагностика браузер-vs-GM_xhr: me=401 → cookies/сессия не долетают; me=200 → сессия есть,
-      // 403 именно на сбор (WAF или Origin/CSRF). waf → почти наверняка StormWall режет автозапрос.
-      const why = (cr.status !== 200)
-        ? ("Superset csrf=" + cr.status + " me=" + me.status + (waf ? " WAF-StormWall" : ""))
-        : "ok";
-      log("Superset csrf", cr.status, "me", me.status, "waf", waf, cr.responseText.slice(0, 160));
-      set("lastResult", new Date().toISOString() + "|" + stg + "|" + why + " :: " + cr.responseText.slice(0, 140).replace(/\|/g, "-").replace(/\s+/g, " "));
+      const stg = (cr.status === 403) ? "no_rights" : "no_session";
+      const why = (cr.status === 403) ? ("аккаунт без прав к Superset (me=" + me.status + ")")
+                : (cr.status === 401) ? "нет сессии Superset"
+                : ("Superset csrf " + cr.status);
+      log("Superset csrf", cr.status, "me", me.status, cr.responseText.slice(0, 120));
+      set("lastResult", new Date().toISOString() + "|" + stg + "|" + why + " / " + cr.responseText.slice(0, 70).replace(/\|/g, "-"));
       return false;
     }
     const csrf = JSON.parse(cr.responseText).result;
@@ -925,10 +1097,53 @@ function ec5Headers(url, headers) {
   if (location.host.indexOf('cashboxng') !== -1) return;   // сотрудники — на ek5/orderec5
   const SRV = 'http://5.42.124.252/ec5-employees';
   const U = 'https://gateway.cdek.ru/coworker/web/coworker/v1/employee/getEmployeeList';
-  const OFFICE_UUID = '931dcd8e-4397-4006-ba9c-2a96ae2ee15d';   // MSK548 = Садовод-1 (под Прокофьевым офис ОДИН)
-  const OFFICE_CODE = 'MSK548';
   const DAYKEY = 'ec5emp:lastrun';
+  const OFFKEY = 'ec5emp:office';   // выученный офис точки (uuid+code), переживает перезагрузки
   const pwt = () => sessionStorage.getItem('pwt') || localStorage.getItem('pwt') || '';
+
+  // Самоопределение офиса: хардкод — ФОЛЛБЭК (Садовод-1). Пассивно подслушиваем
+  // СОБСТВЕННЫЙ запрос приложения getEmployeeList (оператор открыл раздел «Сотрудники»)
+  // и запоминаем office-uuid ЭТОЙ точки. Пока не выучили — работаем на хардкоде, но
+  // getEmployeeList с чужим uuid под другим аккаунтом вернёт пусто → run() просто не
+  // отправит (не перетрёт чужую точку). Всё в try/catch, любой сбой → хардкод.
+  const U_EMP_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+  const ID = { uuid: '931dcd8e-4397-4006-ba9c-2a96ae2ee15d', code: 'MSK548', source: 'config' };
+  try {
+    const saved = (typeof GM_getValue === 'function') ? GM_getValue(OFFKEY, '') : '';
+    if (saved) { const o = JSON.parse(saved); if (o && U_EMP_RE.test(o.uuid || '')) { ID.uuid = o.uuid; ID.code = o.code || ID.code; ID.source = 'learned'; } }
+  } catch (e) {}
+  function learnOffice(body) {
+    try {
+      const j = (typeof body === 'string') ? JSON.parse(body) : body;
+      const f = (j && j.fields) || [];
+      for (const it of f) {
+        if (it && String(it.field).toLowerCase() === 'office') {
+          const u = (it.values && it.values[0]) || it.value;
+          if (U_EMP_RE.test(u || '') && u !== ID.uuid) {
+            ID.uuid = u; ID.code = 'OFF-' + String(u).slice(0, 8); ID.source = 'learned';
+            try { GM_setValue && GM_setValue(OFFKEY, JSON.stringify({ uuid: ID.uuid, code: ID.code })); } catch (e) {}
+          }
+        }
+      }
+    } catch (e) {}
+  }
+  try {
+    const XP = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+    if (XP && !XP.__ec5emp) {
+      const oOpen = XP.open, oSend = XP.send;
+      XP.open = function (m, u) { try { this.__eu = u; } catch (e) {} return oOpen.apply(this, arguments); };
+      XP.send = function (b) { try { if (String(this.__eu || '').indexOf('getEmployeeList') !== -1 && typeof b === 'string') learnOffice(b); } catch (e) {} return oSend.apply(this, arguments); };
+      XP.__ec5emp = true;
+    }
+    const of = window.fetch;
+    if (typeof of === 'function' && !of.__ec5emp) {
+      const wf = function (input, init) {
+        try { let url = (typeof input === 'string') ? input : (input && input.url) || ''; if (url.indexOf('getEmployeeList') !== -1 && init && typeof init.body === 'string') learnOffice(init.body); } catch (e) {}
+        return of.apply(this, arguments);
+      };
+      wf.__ec5emp = true; window.fetch = wf;
+    }
+  } catch (e) {}
   const gm = (method, url, data, headers) => new Promise((res) => {
     GM_xmlhttpRequest({ method, url, data, headers: ec5Headers(url, headers), timeout: 60000,
       onload: (r) => res({ status: r.status, text: r.responseText }),
@@ -936,7 +1151,7 @@ function ec5Headers(url, headers) {
   });
   async function list(status) {
     const body = JSON.stringify({ sort: [], offset: 0, limit: 100,
-      fields: [{ field: 'office', value: null, values: [OFFICE_UUID] },
+      fields: [{ field: 'office', value: null, values: [ID.uuid] },
                { field: 'status', value: status, values: null }],
       columns: ['code','fullName','position','structureDepartment','dateIn','dateOut','status'] });
     const r = await gm('POST', U, body, { 'Content-Type': 'application/json', 'X-Auth-Token': pwt() });
@@ -951,10 +1166,10 @@ function ec5Headers(url, headers) {
     if (works === null) return;                 // ошибка/нет сессии — не портим гейт
     const fired = (await list('FIRED')) || [];  // если значение статуса иное — просто без уволенных (дифф ловит по отсутствию)
     const emps = works.concat(fired).map((e) => ({
-      office: OFFICE_CODE, code: e.code, fio: e.fullName, dept: e.structureDepartment || '',
+      office: ID.code, code: e.code, fio: e.fullName, dept: e.structureDepartment || '',
       pos: e.position || '', dateIn: e.dateIn || '', dateOut: e.dateOut || '', status: e.status || '' }));
     if (!emps.length) return;
-    const pr = await gm('POST', SRV, JSON.stringify({ date: today, office: OFFICE_CODE, source: 'EK5', employees: emps }),
+    const pr = await gm('POST', SRV, JSON.stringify({ date: today, office: ID.code, source: 'EK5', employees: emps }),
       { 'Content-Type': 'application/json' });
     if (pr.status === 200) { try { GM_setValue && GM_setValue(DAYKEY, today); } catch (e) {} }  // гейт только при успехе
   }
