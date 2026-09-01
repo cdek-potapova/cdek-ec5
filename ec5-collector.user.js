@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.20
+// @version      0.9.21
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -1008,7 +1008,7 @@ function ec5Headers(url, headers) {
     });
   }
 
-  async function supQuery(datasetId, columns, metrics, where, timeRange, csrf) {
+  async function supQuery(datasetId, columns, metrics, where, timeRange) {
     const body = JSON.stringify({
       datasource: { id: datasetId, type: "table" },
       result_format: "json", result_type: "full",
@@ -1017,27 +1017,32 @@ function ec5Headers(url, headers) {
         granularity: "date_value", time_range: timeRange, row_limit: 200, orderby: [],
       }],
     });
+    // CSRF НЕ шлём: на этом инстансе Superset (JWT-cookie CSRF) /security/csrf_token/
+    // отдаёт 403, а chart/data принимается по одной session-cookie без X-CSRFToken
+    // (проверено 02.09 в директор-сессии). Заголовки — браузерные (для WAF StormWall).
     const r = await gm("POST", SUP + "/api/v1/chart/data", body,
-      { "Content-Type": "application/json", "X-CSRFToken": csrf, "Referer": SUP + "/" });
+      { "Content-Type": "application/json", "Accept": "application/json", "Referer": SUP + "/" });
     if (r.status !== 200) throw new Error("chart/data " + r.status + " " + r.responseText.slice(0, 200));
     return JSON.parse(r.responseText).result[0].data;
   }
 
   async function collect(period, monthKey, timeRange) {
     log("сбор", period, timeRange);
-    // сессия Superset жива? (тянем csrf; при 401 — не собираем, попробуем в след. заход)
-    const cr = await gm("GET", SUP + "/api/v1/security/csrf_token/", null, { "Referer": SUP + "/" });
-    if (cr.status !== 200) {
-      const me = await gm("GET", SUP + "/api/v1/me/", null, { "Referer": SUP + "/" });
-      const stg = (cr.status === 403) ? "no_rights" : "no_session";
-      const why = (cr.status === 403) ? ("аккаунт без прав к Superset (me=" + me.status + ")")
-                : (cr.status === 401) ? "нет сессии Superset"
-                : ("Superset csrf " + cr.status);
-      log("Superset csrf", cr.status, "me", me.status, cr.responseText.slice(0, 120));
-      set("lastResult", new Date().toISOString() + "|" + stg + "|" + why + " / " + cr.responseText.slice(0, 70).replace(/\|/g, "-"));
+    // Есть ли живая сессия Superset? Проверяем /api/v1/me/ (200 = вошли по SSO).
+    // НЕ гейтим на /security/csrf_token/: на этом инстансе он отдаёт 403 (JWT-cookie
+    // CSRF), и старый код бросал сбор впустую, хотя chart/data работает без CSRF.
+    // 200 у me не гарантирует прав к датасету (у оператора нет) — если прав нет,
+    // сам chart/data вернёт 403 и supQuery бросит ошибку (это ловит run()).
+    const me = await gm("GET", SUP + "/api/v1/me/", null, { "Referer": SUP + "/" });
+    if (me.status !== 200) {
+      const stg = (me.status === 403) ? "no_rights" : "no_session";
+      const why = (me.status === 403) ? "аккаунт без прав к Superset"
+                : (me.status === 401) ? "нет сессии Superset"
+                : ("Superset me " + me.status);
+      log("Superset me", me.status, me.responseText.slice(0, 120));
+      set("lastResult", new Date().toISOString() + "|" + stg + "|" + why);
       return false;
     }
-    const csrf = JSON.parse(cr.responseText).result;
 
     const w2701 = "(" + CODES.map((c) => `${OFF_2701} LIKE '${c}%'`).join(" OR ") + ")";
     const w2446 = "(" + CODES.map((c) => `${OFF_2446} LIKE '${c}%'`).join(" OR ") + ")";
@@ -1045,7 +1050,7 @@ function ec5Headers(url, headers) {
     const byPvz = await supQuery(2701,
       [{ expressionType: "SQL", sqlExpression: OFF_2701, label: "office" }],
       ["Выручка за упаковку", { expressionType: "SQL", sqlExpression: "SUM(cnt_package)", label: "qty" }],
-      w2701, timeRange, csrf);
+      w2701, timeRange);
     const salesByPvz = {};
     for (const row of byPvz) {
       const code = (row.office || "").split(",")[0].trim();
@@ -1059,7 +1064,7 @@ function ec5Headers(url, headers) {
     let salesByType = [];
     try {
       const byType = await supQuery(2446, ["ADD_SERVICE_NAME"],
-        ["Выручка, руб", "Кол-во заказов"], w2446, timeRange, csrf);
+        ["Выручка, руб", "Кол-во заказов"], w2446, timeRange);
       salesByType = byType.map((r) => ({
         type: r.ADD_SERVICE_NAME, rub: Math.round(r["Выручка, руб"] || 0), orders: r["Кол-во заказов"] || 0,
       })).filter((x) => x.type && x.orders > 0);
