@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.21
+// @version      0.9.22
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -987,7 +987,7 @@ function ec5Headers(url, headers) {
     try {
       GM_xmlhttpRequest({
         method: "POST", url: "http://5.42.124.252/ec5-pulse",
-        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.20",
+        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.22",
           host: location.hostname || "", note: (ok ? "ok " : "postfail ") + "rub=" + (rub || 0) }),
         headers: ec5Headers("http://5.42.124.252/ec5-pulse", { "Content-Type": "application/json" }),
         onload: () => {}, onerror: () => {},
@@ -1099,7 +1099,11 @@ function ec5Headers(url, headers) {
     // --- недельный: не чаще раза в 7 дней, текущий месяц по сегодня ---
     const last = get("lastWeekly");
     const days = last ? (now - new Date(last)) / 86400000 : 999;
-    if (days >= 7) {
+    // РАЗ В СУТКИ (было 7 дн): сводка по упаковке уходит ЕЖЕДНЕВНО
+    // (upack-push.timer, 09:00 МСК) и шлёт только изменившееся. При гейте в
+    // неделю снапшот текущего месяца обновлялся раз в 7 дн и push почти всегда
+    // писал "данные не менялись — пропуск". Ключ намеренно оставлен lastWeekly.
+    if (days >= 1) {
       const y = now.getFullYear(), m = now.getMonth() + 1;
       const start = `${y}-${String(m).padStart(2, "0")}-01`;
       const end = iso(new Date(now.getTime() + 86400000)); // включая сегодня
