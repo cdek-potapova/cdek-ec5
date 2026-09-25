@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.24
+// @version      0.9.25
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -10,6 +10,7 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_openInTab
 // @connect      gateway.cdek.ru
 // @connect      script.google.com
 // @connect      script.googleusercontent.com
@@ -606,7 +607,12 @@ function ec5Headers(url, headers) {
     CASH_UUIDS: ['db7420b0-e528-41e7-a81f-1585cfaed4e1'],  // касса MSK548, одна (подтв.)
     OPS_LIMIT: 100,
     PAGE_HARD_CAP: 200,     // защита от бесконечного листания (макс страниц = cap/limit)
-    VER: '0.4.0',
+    VER: '0.5.0',
+    // Вечерние снимки кассы ПО РАСПИСАНИЮ (0.5.0), локальное время ПК точки. Снимаем
+    // текущую смену как есть, НЕ дожидаясь кнопки «закрыть смену»: на Сад-1/ТЯК смену
+    // закрывают на другом ПК, и снимка по закрытию там не бывает вовсе. Второй слот —
+    // страховка (докинутся поздние операции). Окно слота — 90 минут.
+    EVE_SLOTS: ['21:00', '23:00'],
   };
 
   const pwt = () => sessionStorage.getItem('pwt') || localStorage.getItem('pwt') || '';
@@ -865,8 +871,9 @@ function ec5Headers(url, headers) {
   }
 
   // ---------- Отправка: помечаем снятым ТОЛЬКО если сервер принял ----------
-  async function sendShift(log) {
-    pulse('kassa-run', 0);
+  async function sendShift(log, opts) {
+    opts = opts || {};
+    pulse(opts.force ? 'kassa-eve-run' : 'kassa-run', 0);
     if (!(await waitPwt(15))) { log && log('⚠️ нет токена pwt — смена не снята, повтор позже'); pulse('kassa-notoken', 0); return false; }
     const ident = await resolveIdentity();
     log && log(`касса точки: source=${ident.source}, office=${ident.officeCode}, касс=${ident.cashUuids.length}`);
@@ -874,9 +881,20 @@ function ec5Headers(url, headers) {
     const day = isoFromDDMM(shift.date) || isoDay();   // дата СМЕНЫ (по операциям), не «сегодня»
     // ключ дедупа привязан к офису — чтобы разные точки не гасили снятие друг у друга
     const key = sentKey(ident.officeCode + ':' + day);
-    try { if (localStorage.getItem(key) === '1') return true; } catch (e) {}
+    // ключ хранит число собранных операций (раньше '1' — совместимо): плановый снимок
+    // идёт поверх снимка по закрытию, но НЕ меньшим числом операций (это уже новая смена)
+    let sentN = 0; try { sentN = parseInt(localStorage.getItem(key) || '0', 10) || 0; } catch (e) {}
+    if (!opts.force && sentN > 0) return true;
     if (shift.incomplete) pulse('kassa-incomplete', shift.collected, ident);
     if (shift.empty) pulse('kassa-empty', 0, ident);
+    if (opts.force) {
+      // Плановый снимок: пустую/неполную смену НЕ шлём — сервер держит одну строку на
+      // (office,date) и пустышка перетёрла бы нормальный снимок по закрытию. Меньше
+      // операций, чем уже отправляли, — значит открылась новая смена, тоже не шлём.
+      if (shift.empty) { log && log('плановый снимок: смена пустая — не шлю'); pulse('kassa-eve-skip', 0, ident); return 'skip'; }
+      if (shift.incomplete) { log && log('плановый снимок: смена неполная — не шлю'); pulse('kassa-eve-skip', shift.collected, ident); return 'skip'; }
+      if (sentN && shift.collected < sentN) { log && log('плановый снимок: операций меньше, чем уже слали (' + shift.collected + '<' + sentN + ') — новая смена, не шлю'); pulse('kassa-eve-skip', shift.collected, ident); return 'skip'; }
+    }
     // ЗАЩИТА ОТ ПЕРЕТИРАНИЯ ЧУЖОЙ ТОЧКИ: сервер держит одну строку на (office,date)
     // с ON CONFLICT REPLACE. Если самоопределение не сработало (source=config) и смена
     // пустая — это, скорее всего, НЕ Садовод-1 (чужой токен к нашей кассе даёт пусто).
@@ -901,9 +919,43 @@ function ec5Headers(url, headers) {
     } catch (e) { log && log('⚠️ не достучался до сервера: ' + ((e && e.message) || '')); }
     // помечаем день снятым только при валидной смене: пустую/сомнительную НЕ фиксируем,
     // чтобы ручной повтор мог снять правильную, пока она ещё «последняя».
-    if (savedOurs && !shift.empty) { try { localStorage.setItem(key, '1'); } catch (e) {} pulse('kassa-ok', shift.collected, ident); }
+    if (savedOurs && !shift.empty) { try { localStorage.setItem(key, String(Math.max(sentN, shift.collected || 1))); } catch (e) {} pulse(opts.force ? 'kassa-eve-ok' : 'kassa-ok', shift.collected, ident); }
     return savedOurs;
   }
+
+  // ---------- Плановые вечерние снимки (0.5.0) ----------
+  // Слот = «день@ЧЧ:ММ». Отметка о выполнении — в GM-хранилище (общее для всех вкладок и
+  // origin'ов этого скрипта), чтобы вкладка ek5-открывашки и вкладка кассира не снимали
+  // дважды. Вкладка, открытая планировщиком с ek5 (?ec5auto=1), закрывает себя сама.
+  const EVE_DONE = 'kassa:eveDone', EVE_ALIVE = 'kassa:alive';
+  const gget = (k, d) => { try { return GM_getValue(k, d); } catch (e) { return d; } };
+  const gset = (k, v) => { try { GM_setValue(k, v); } catch (e) {} };
+  function eveSlot() {
+    const d = new Date(), hm = d.getHours() * 60 + d.getMinutes();
+    for (const s of CONFIG.EVE_SLOTS) {
+      const t = s.split(':').map(Number), m = t[0] * 60 + t[1];
+      if (hm >= m && hm < m + 90) return isoDay() + '@' + s;
+    }
+    return null;
+  }
+  const isAutoTab = /[?&]ec5auto=1/.test(location.search);
+  let eveBusy = false, eveNoTokenTries = 0;
+  async function eveTick() {
+    const id = eveSlot();
+    if (!id || eveBusy) return;
+    if (gget(EVE_DONE, '') === id) { if (isAutoTab) { try { window.close(); } catch (e) {} } return; }
+    eveBusy = true;
+    try {
+      const r = await sendShift(clog, { force: true });
+      // false = нет токена / сервер не принял → повтор через минуту (не больше 5 раз за слот)
+      if (r !== false || ++eveNoTokenTries >= 5) { gset(EVE_DONE, id); eveNoTokenTries = 0; if (isAutoTab) { try { window.close(); } catch (e) {} } }
+    } catch (e) { clog('плановый снимок не удался: ' + (e && e.message)); }
+    finally { eveBusy = false; }
+  }
+  const markAlive = () => gset(EVE_ALIVE, Date.now());
+  markAlive(); setInterval(markAlive, 30 * 1000);
+  setTimeout(eveTick, isAutoTab ? 20 * 1000 : 45 * 1000);
+  setInterval(eveTick, 60 * 1000);
 
   // ---------- Ручной запуск (меню) ----------
   const clog = (m) => console.log('[ec5-kassa]', m);
@@ -987,7 +1039,7 @@ function ec5Headers(url, headers) {
     try {
       GM_xmlhttpRequest({
         method: "POST", url: "http://5.42.124.252/ec5-pulse",
-        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.24",
+        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.25",
           host: location.hostname || "", note: (ok ? "ok " : "postfail ") + "rub=" + (rub || 0) }),
         headers: ec5Headers("http://5.42.124.252/ec5-pulse", { "Content-Type": "application/json" }),
         onload: () => {}, onerror: () => {},
@@ -1218,4 +1270,54 @@ function ec5Headers(url, headers) {
     if (pr.status === 200) { try { GM_setValue && GM_setValue(DAYKEY, today); } catch (e) {} }  // гейт только при успехе
   }
   setTimeout(run, 120000);   // раз в сутки, через 2 мин после открытия
+})();
+
+// ===================== ОТКРЫВАШКА КАССЫ ДЛЯ ПЛАНОВОГО СНИМКА (0.9.25; работает на ek5/orderec5) =====================
+// На ПК, где стоит скрипт, вкладка ЭК5 открыта весь день (по ней идёт трафик), а касса
+// (cashboxng) может быть открыта на ДРУГОМ ПК. Поэтому в вечерний слот открывашка сама
+// поднимает cashboxng фоновой вкладкой: SSO-сессия оператора жива, приложение логинится
+// без пароля, кассовый блок выше делает плановый снимок и вкладка закрывается.
+// Оператор ничего не открывает и не держит.
+(function () {
+  'use strict';
+  if (location.host.indexOf('cashboxng') !== -1) return;
+  if (typeof GM_openInTab !== 'function' || typeof GM_getValue !== 'function') return;
+  const SLOTS = ['21:00', '23:00'];               // = CONFIG.EVE_SLOTS кассового блока
+  const KASSA_URL = 'https://cashboxng.cdek.ru/?ec5auto=1';
+  const PULSE_URL = 'http://5.42.124.252/ec5-pulse';
+  const gget = (k, d) => { try { return GM_getValue(k, d); } catch (e) { return d; } };
+  const gset = (k, v) => { try { GM_setValue(k, v); } catch (e) {} };
+  const isoDay = () => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
+  function eveSlot() {
+    const d = new Date(), hm = d.getHours() * 60 + d.getMinutes();
+    for (const s of SLOTS) { const t = s.split(':').map(Number), m = t[0] * 60 + t[1]; if (hm >= m && hm < m + 90) return isoDay() + '@' + s; }
+    return null;
+  }
+  function pulseOpen(id, note) {
+    try {
+      GM_xmlhttpRequest({ method: 'POST', url: PULSE_URL, headers: ec5Headers(PULSE_URL, { 'Content-Type': 'application/json' }),
+        data: JSON.stringify({ event: 'kassa-autotab', rows: 0, host: location.hostname || '', ver: '0.5.0', note: note + ' ' + id }), onload: () => {}, onerror: () => {} });
+    } catch (e) {}
+  }
+  let handle = null, handleId = '';
+  const closeHandle = () => { if (handle) { try { handle.close(); } catch (e) {} handle = null; handleId = ''; } };
+  function tick() {
+    const id = eveSlot();
+    if (!id) { closeHandle(); return; }
+    if (gget('kassa:eveDone', '') === id) { if (handleId === id) closeHandle(); return; }
+    // касса уже открыта в этом браузере (кассир работает в ней) — её кассовый блок снимет сам
+    if (Date.now() - (Number(gget('kassa:alive', 0)) || 0) < 90 * 1000) return;
+    // не чаще раза в 7 минут и не больше 3 попыток на слот (другая вкладка ЭК5 могла уже открыть)
+    const req = String(gget('kassa:autoReq', '')).split('|');      // id|ts|n
+    let n = 0;
+    if (req[0] === id) { n = Number(req[2]) || 0; if (Date.now() - (Number(req[1]) || 0) < 7 * 60 * 1000) return; if (n >= 3) return; }
+    gset('kassa:autoReq', id + '|' + Date.now() + '|' + (n + 1));
+    closeHandle();
+    try { handle = GM_openInTab(KASSA_URL, { active: false, insert: true, setParent: true }); handleId = id; }
+    catch (e) { handle = null; pulseOpen(id, 'open-failed'); return; }
+    pulseOpen(id, 'opened');
+    setTimeout(() => { if (handleId === id) closeHandle(); }, 6 * 60 * 1000);   // страховка: не висеть вечно
+  }
+  setTimeout(tick, 20 * 1000);
+  setInterval(tick, 60 * 1000);
 })();
