@@ -610,9 +610,10 @@ function ec5Headers(url, headers) {
     VER: '0.5.0',
     // Вечерние снимки кассы ПО РАСПИСАНИЮ (0.5.0), локальное время ПК точки. Снимаем
     // текущую смену как есть, НЕ дожидаясь кнопки «закрыть смену»: на Сад-1/ТЯК смену
-    // закрывают на другом ПК, и снимка по закрытию там не бывает вовсе. Второй слот —
-    // страховка (докинутся поздние операции). Окно слота — 90 минут.
-    EVE_SLOTS: ['21:00', '23:00'],
+    // закрывают на другом ПК, и снимка по закрытию там не бывает вовсе. ПК точек живут
+    // до ~19:00 МСК (по pulse.jsonl), поэтому слоты вечерние, но рабочие; каждый
+    // следующий снимок ложится поверх предыдущего, если операций не меньше. Окно — 60 мин.
+    EVE_SLOTS: ['17:30', '18:30', '19:30'],
   };
 
   const pwt = () => sessionStorage.getItem('pwt') || localStorage.getItem('pwt') || '';
@@ -905,6 +906,11 @@ function ec5Headers(url, headers) {
       return false;
     }
     const payload = { source: 'ec5-kassa-userscript', version: CONFIG.VER, date: day,
+      // snapshot: 'close' = по закрытию смены/ручной, 'schedule' = плановый; shiftState —
+      // что написано в шапке кассы в момент снимка (open/closed/null). Писатель в
+      // статистику по shiftState=open не занижает уже стоящую ручную цифру.
+      snapshot: opts.force ? 'schedule' : 'close', shiftState: (typeof readState === 'function' ? readState() : null),
+      snapTime: new Date().toISOString(),
       pvz: ident.pvz, office: ident.officeCode, detectSource: ident.source, cashUuids: ident.cashUuids,
       hasReturn: shift.hasReturn, returnOperators: shift.returnOperators,
       incomplete: shift.incomplete, empty: shift.empty,
@@ -934,7 +940,7 @@ function ec5Headers(url, headers) {
     const d = new Date(), hm = d.getHours() * 60 + d.getMinutes();
     for (const s of CONFIG.EVE_SLOTS) {
       const t = s.split(':').map(Number), m = t[0] * 60 + t[1];
-      if (hm >= m && hm < m + 90) return isoDay() + '@' + s;
+      if (hm >= m && hm < m + 60) return isoDay() + '@' + s;
     }
     return null;
   }
@@ -1282,7 +1288,7 @@ function ec5Headers(url, headers) {
   'use strict';
   if (location.host.indexOf('cashboxng') !== -1) return;
   if (typeof GM_openInTab !== 'function' || typeof GM_getValue !== 'function') return;
-  const SLOTS = ['21:00', '23:00'];               // = CONFIG.EVE_SLOTS кассового блока
+  const SLOTS = ['17:30', '18:30', '19:30'];      // = CONFIG.EVE_SLOTS кассового блока
   const KASSA_URL = 'https://cashboxng.cdek.ru/?ec5auto=1';
   const PULSE_URL = 'http://5.42.124.252/ec5-pulse';
   const gget = (k, d) => { try { return GM_getValue(k, d); } catch (e) { return d; } };
@@ -1290,7 +1296,7 @@ function ec5Headers(url, headers) {
   const isoDay = () => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
   function eveSlot() {
     const d = new Date(), hm = d.getHours() * 60 + d.getMinutes();
-    for (const s of SLOTS) { const t = s.split(':').map(Number), m = t[0] * 60 + t[1]; if (hm >= m && hm < m + 90) return isoDay() + '@' + s; }
+    for (const s of SLOTS) { const t = s.split(':').map(Number), m = t[0] * 60 + t[1]; if (hm >= m && hm < m + 60) return isoDay() + '@' + s; }
     return null;
   }
   function pulseOpen(id, note) {
