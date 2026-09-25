@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.22
+// @version      0.9.23
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -987,7 +987,7 @@ function ec5Headers(url, headers) {
     try {
       GM_xmlhttpRequest({
         method: "POST", url: "http://5.42.124.252/ec5-pulse",
-        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.22",
+        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.23",
           host: location.hostname || "", note: (ok ? "ok " : "postfail ") + "rub=" + (rub || 0) }),
         headers: ec5Headers("http://5.42.124.252/ec5-pulse", { "Content-Type": "application/json" }),
         onload: () => {}, onerror: () => {},
@@ -1045,7 +1045,11 @@ function ec5Headers(url, headers) {
     }
 
     const w2701 = "(" + CODES.map((c) => `${OFF_2701} LIKE '${c}%'`).join(" OR ") + ")";
-    const w2446 = "(" + CODES.map((c) => `${OFF_2446} LIKE '${c}%'`).join(" OR ") + ")";
+    // 25.09: 2446 фильтруем по ТОМУ ЖЕ офису-отправителю (from_office), что и 2701,
+    // и только «Без договора» — иначе таблица позиций суммировалась в 2× от блока
+    // «Продажа по ПВЗ» (в неё попадала упаковка по договорам ИМ) и Мария видела
+    // «расхождение» на одном листе. Упаковку по договорам шлём отдельно.
+    const w2446 = "(" + CODES.map((c) => `${OFF_2701} LIKE '${c}%'`).join(" OR ") + ")";
 
     const byPvz = await supQuery(2701,
       [{ expressionType: "SQL", sqlExpression: OFF_2701, label: "office" }],
@@ -1057,20 +1061,23 @@ function ec5Headers(url, headers) {
       if (CODES.includes(code)) salesByPvz[code] = { rub: Math.round(row["Выручка за упаковку"] || 0), qty: row.qty || 0 };
     }
 
-    // Разбивка по типам (наценка) — датасет 2446. НЕ верифицирован так же надёжно,
-    // как 2701 (продажи по ПВЗ — главное для Марии). Поэтому best-effort: если 2446
-    // упадёт (нет колонки date_value / сменилось имя метрики / права), НЕ роняем весь
-    // сбор, а шлём хотя бы sales_by_pvz. Наценочная таблица просто будет пустой.
-    let salesByType = [];
+    // Разбивка по типам (наценка) — датасет 2446, срез «частные клиенты без договора»
+    // (совпадает с 2701 в пределах ~1,5%). Best-effort: если 2446 упадёт, шлём хотя бы ПВЗ.
+    let salesByType = [], salesByContract = [];
     try {
       const byType = await supQuery(2446, ["ADD_SERVICE_NAME"],
-        ["Выручка, руб", "Кол-во заказов"], w2446, timeRange);
+        ["Выручка, руб", "Кол-во заказов"], w2446 + " AND CONTRACT_TYPE_NAME = 'Без договора'", timeRange);
       salesByType = byType.map((r) => ({
         type: r.ADD_SERVICE_NAME, rub: Math.round(r["Выручка, руб"] || 0), orders: r["Кол-во заказов"] || 0,
       })).filter((x) => x.type && x.orders > 0);
-    } catch (e) { log("2446 (типы) не собрался, шлём только ПВЗ:", (e && e.message) || e); }
+      const byContract = await supQuery(2446, ["CONTRACT_TYPE_NAME"],
+        ["Выручка, руб", "Кол-во заказов"], w2446, timeRange);
+      salesByContract = byContract.map((r) => ({
+        contract: r.CONTRACT_TYPE_NAME || "—", rub: Math.round(r["Выручка, руб"] || 0), orders: r["Кол-во заказов"] || 0,
+      })).filter((x) => x.orders > 0);
+    } catch (e) { log("2446 (типы/договоры) не собрался, шлём только ПВЗ:", (e && e.message) || e); }
 
-    const payload = { period, month_key: monthKey, sales_by_pvz: salesByPvz, sales_by_type: salesByType };
+    const payload = { period, month_key: monthKey, sales_by_pvz: salesByPvz, sales_by_type: salesByType, sales_by_contract: salesByContract };
     let tq = 0, tr = 0;
     for (const c of CODES) { const d = salesByPvz[c]; if (d) { tq += d.qty || 0; tr += d.rub || 0; } }
 
