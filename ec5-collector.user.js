@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.25
+// @version      0.9.26
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -1045,7 +1045,7 @@ function ec5Headers(url, headers) {
     try {
       GM_xmlhttpRequest({
         method: "POST", url: "http://5.42.124.252/ec5-pulse",
-        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.25",
+        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.26",
           host: location.hostname || "", note: (ok ? "ok " : "postfail ") + "rub=" + (rub || 0) }),
         headers: ec5Headers("http://5.42.124.252/ec5-pulse", { "Content-Type": "application/json" }),
         onload: () => {}, onerror: () => {},
@@ -1326,4 +1326,100 @@ function ec5Headers(url, headers) {
   }
   setTimeout(tick, 20 * 1000);
   setInterval(tick, 60 * 1000);
+})();
+
+// ===================== СТАТ-ТОЧЕК: выдачи/отправки из Superset → /ec5-stats (0.9.26; на ek5/orderec5) =====================
+// Таблицы «статистики» ПВЗ админы заполняют руками. Этот блок раз в день берёт из Superset
+// (датасет 1265 f_proceed_cube_by_orders_gp_distributed) по ВСЕМ четырём ПВЗ за последние
+// 8 дней: выдано заказов/мест (to_office = ПВЗ, delivery_date) и создано заказов/мест
+// (from_office = ПВЗ, order_date, в разрезе типа договора) и шлёт на сервер. Сервер сам
+// решает, что писать в таблицы (office_stats_writer.py). Доступ к Superset у оператора точки
+// есть (тот же SSO, что и упаковка). Любая живая точка покрывает все четыре — поэтому
+// шлём за все, а не только за свою.
+(function () {
+  'use strict';
+  if (location.host.indexOf('cashboxng') !== -1) return;
+  if (typeof GM_xmlhttpRequest !== 'function' || typeof GM_getValue !== 'function') return;
+  const SUP = 'https://superset.cdek.ru', SRV = 'http://5.42.124.252/ec5-stats', PULSE = 'http://5.42.124.252/ec5-pulse';
+  const CODES = ['MSK548', 'MSK456', 'KAM32', 'MSK2432'];
+  const DAYS_BACK = 8, DAYKEY = 'stats:lastRun';          // «день@слот»
+  const SLOTS = ['10:00', '15:00'];                        // утром — вчера; днём — догон (данные Superset доезжают с лагом)
+  const gget = (k, d) => { try { return GM_getValue(k, d); } catch (e) { return d; } };
+  const gset = (k, v) => { try { GM_setValue(k, v); } catch (e) {} };
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const log = (...a) => console.log('[stats]', ...a);
+  function gm(method, url, body, headers) {
+    return new Promise((res, rej) => {
+      GM_xmlhttpRequest({ method, url, data: body || null, headers: ec5Headers(url, headers), timeout: 90000,
+        onload: (r) => res(r), onerror: () => rej(new Error('net ' + url)), ontimeout: () => rej(new Error('timeout ' + url)) });
+    });
+  }
+  function pulse(event, rows, note) {
+    try { GM_xmlhttpRequest({ method: 'POST', url: PULSE, data: JSON.stringify({ event, rows: rows || 0, host: location.hostname || '', ver: '0.9.26', note: note || '' }),
+      headers: ec5Headers(PULSE, { 'Content-Type': 'application/json' }), onload: () => {}, onerror: () => {} }); } catch (e) {}
+  }
+  // сессия Superset: как в упаковке — при 401 тихо поднимаем через SSO-iframe (без пароля)
+  let warmedAt = 0;
+  function warmup() {
+    return new Promise((resolve) => {
+      if (Date.now() - warmedAt < 20 * 60 * 1000) { resolve(false); return; }
+      warmedAt = Date.now();
+      let ifr; try { ifr = document.createElement('iframe'); ifr.style.cssText = 'position:absolute;left:-9999px;width:0;height:0;border:0;visibility:hidden';
+        ifr.src = SUP + '/login/keycloak'; document.documentElement.appendChild(ifr); } catch (e) { resolve(false); return; }
+      setTimeout(() => { try { ifr.remove(); } catch (e) {} resolve(true); }, 6000);
+    });
+  }
+  async function me() { try { return (await gm('GET', SUP + '/api/v1/me/')).status; } catch (e) { return 0; } }
+  const OFF = (c) => `dictGet('bi.dct_company_structure','office_name',${c})`;
+  const LIKE = (col) => '(' + CODES.map((c) => `${OFF(col)} LIKE '${c}%'`).join(' OR ') + ')';
+  async function chart(gran, where, extraCols, tr) {
+    const body = { datasource: { id: 1265, type: 'table' }, result_format: 'json', result_type: 'full',
+      queries: [{ columns: [gran, { expressionType: 'SQL', sqlExpression: 'splitByChar(\',\', ' + OFF(gran === 'delivery_date' ? 'to_office_uuid' : 'from_office_uuid') + ')[1]', label: 'code' }].concat(extraCols || []),
+        metrics: [{ expressionType: 'SQL', sqlExpression: 'COUNT(DISTINCT order_number)', label: 'o' }, { expressionType: 'SQL', sqlExpression: 'SUM(order_places_count)', label: 'p' }],
+        filters: [], extras: { where }, granularity: gran, time_range: tr, row_limit: 2000, orderby: [] }] };
+    const r = await gm('POST', SUP + '/api/v1/chart/data', JSON.stringify(body), { 'Content-Type': 'application/json', 'Accept': 'application/json', 'Origin': SUP, 'Referer': SUP + '/' });
+    if (r.status !== 200) throw new Error('chart/data HTTP ' + r.status + ' ' + String(r.responseText || '').slice(0, 120));
+    return JSON.parse(r.responseText).result[0].data;
+  }
+  async function collect() {
+    const to = new Date(); const from = new Date(to.getTime() - DAYS_BACK * 86400000);
+    const tr = iso(from) + ' : ' + iso(new Date(to.getTime() + 86400000));
+    const rows = {};                                          // code|date -> row
+    const at = (code, d) => { const k = code + '|' + d; return rows[k] || (rows[k] = { office: code, date: d }); };
+    const D = (x) => new Date(x).toISOString().slice(0, 10);
+    for (const x of await chart('delivery_date', LIKE('to_office_uuid'), null, tr)) { const r = at((x.code || '').trim(), D(x.delivery_date)); r.deliv_o = x.o; r.deliv_p = x.p; }
+    for (const x of await chart('order_date', LIKE('from_office_uuid'), ['CONTRACT_TYPE_NAME'], tr)) {
+      const r = at((x.code || '').trim(), D(x.order_date)); r.send_o = (r.send_o || 0) + x.o; r.send_p = (r.send_p || 0) + x.p;
+      const t = x.CONTRACT_TYPE_NAME || '';
+      const key = /ИМ/i.test(t) ? 'im' : /без договора/i.test(t) ? 'nocontract' : /курьер/i.test(t) ? 'courier' : 'other';
+      r[key + '_o'] = (r[key + '_o'] || 0) + x.o; r[key + '_p'] = (r[key + '_p'] || 0) + x.p;
+    }
+    return Object.values(rows).filter((r) => CODES.indexOf(r.office) !== -1);
+  }
+  function slotId() {
+    const d = new Date(), hm = d.getHours() * 60 + d.getMinutes();
+    for (const s of SLOTS) { const t = s.split(':').map(Number), m = t[0] * 60 + t[1]; if (hm >= m && hm < m + 180) return iso(d) + '@' + s; }
+    return null;
+  }
+  let busy = false;
+  async function run(force) {
+    if (busy) return; busy = true;
+    try {
+      const id = force ? 'manual@' + Date.now() : slotId();
+      if (!id || (!force && gget(DAYKEY, '') === id)) return;
+      let st = await me();
+      if (st === 401 && (await warmup())) st = await me();
+      if (st < 200 || st >= 300) { log('Superset недоступен: HTTP ' + st); pulse('stats-noaccess', 0, 'me=' + st); return; }
+      const rows = await collect();
+      const r = await gm('POST', SRV, JSON.stringify({ source: 'ec5-stats-userscript', version: '0.9.26', rows }), { 'Content-Type': 'application/json' });
+      const ok = r.status === 200;
+      log((ok ? '✅ отправлено строк ' : '⚠️ сервер не принял, HTTP ' + r.status + ' строк ') + rows.length);
+      pulse(ok ? 'stats-ok' : 'stats-postfail', rows.length, id);
+      if (ok && !force) gset(DAYKEY, id);
+    } catch (e) { log('сбор не удался: ' + (e && e.message)); pulse('stats-error', 0, String(e && e.message).slice(0, 80)); }
+    finally { busy = false; }
+  }
+  if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand('📊 Стат-точек: собрать сейчас', () => run(true));
+  setTimeout(() => run(false), 150 * 1000);
+  setInterval(() => run(false), 10 * 60 * 1000);
 })();
