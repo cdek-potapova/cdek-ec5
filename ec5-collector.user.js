@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.26
+// @version      0.9.27
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -1045,7 +1045,7 @@ function ec5Headers(url, headers) {
     try {
       GM_xmlhttpRequest({
         method: "POST", url: "http://5.42.124.252/ec5-pulse",
-        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.26",
+        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.27",
           host: location.hostname || "", note: (ok ? "ok " : "postfail ") + "rub=" + (rub || 0) }),
         headers: ec5Headers("http://5.42.124.252/ec5-pulse", { "Content-Type": "application/json" }),
         onload: () => {}, onerror: () => {},
@@ -1422,4 +1422,59 @@ function ec5Headers(url, headers) {
   if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand('📊 Стат-точек: собрать сейчас', () => run(true));
   setTimeout(() => run(false), 150 * 1000);
   setInterval(() => run(false), 10 * 60 * 1000);
+})();
+
+// ===================== РАЗВЕДКА ОТЧЁТА «КОМПЛЕКСНЫЙ ПРИХОД» (0.9.27; на ek5/orderec5) =====================
+// Скрам 28.09: «Отправку» за день админы берут из отчёта ЭК5 «Комплексный приход». Его API
+// у нас нигде не записан, а ЭК5 из Chrome Артёма не залогинен. Поэтому пассивно слушаем
+// СОБСТВЕННЫЕ запросы приложения на ПК точки (та же техника, что самоопределение кассы):
+// всё к gateway.cdek.ru, кроме уже известных путей, шлём в /ec5-probe (адрес, тело, начало
+// ответа). Когда админ откроет отчёт на ПК со скриптом — запрос окажется в probe.jsonl,
+// и следующая версия будет считать отправки/грузоместа/договоры сама. Поведение страницы
+// не меняем, ничего не перехватываем — только читаем. Не больше 60 записей в день.
+(function () {
+  'use strict';
+  if (location.host.indexOf('cashboxng') !== -1) return;
+  if (typeof GM_xmlhttpRequest !== 'function') return;
+  const PROBE = 'http://5.42.124.252/ec5-probe';
+  const KNOWN = ['/order/web/journal/getFilterData', '/order/web/order/getByNumber', '/coworker/web/', '/cashbox-operating/', '/ec5-'];
+  const seen = new Set(); let sent = 0, day = new Date().toDateString();
+  const cut = (s, n) => String(s == null ? '' : s).slice(0, n);
+  function post(method, url, body, resp) {
+    try {
+      if (new Date().toDateString() !== day) { day = new Date().toDateString(); sent = 0; seen.clear(); }
+      const u = String(url || ''); if (u.indexOf('gateway.cdek.ru') === -1 && u.indexOf('/web/') === -1) return;
+      if (KNOWN.some((k) => u.indexOf(k) !== -1)) return;
+      const key = u.split('?')[0] + '|' + cut(body, 200);
+      if (seen.has(key) || sent >= 60) return; seen.add(key); sent++;
+      GM_xmlhttpRequest({ method: 'POST', url: PROBE, headers: ec5Headers(PROBE, { 'Content-Type': 'application/json' }),
+        data: JSON.stringify({ method, url: cut(u, 300), body: cut(body, 6000), resp: cut(resp, 1500) }), onload: () => {}, onerror: () => {} });
+    } catch (e) {}
+  }
+  try {
+    const of = window.fetch;
+    if (typeof of === 'function' && !of.__ec5p) {
+      const wf = function (input, init) {
+        let url = ''; try { url = (typeof input === 'string') ? input : (input && input.url) || ''; } catch (e) {}
+        const method = (init && init.method) || 'GET', body = (init && typeof init.body === 'string') ? init.body : '';
+        const p = of.apply(this, arguments);
+        try { p.then((r) => { try { r.clone().text().then((t) => post(method, url, body, t)).catch(() => {}); } catch (e) {} }).catch(() => {}); } catch (e) {}
+        return p;
+      };
+      wf.__ec5p = true; window.fetch = wf;
+    }
+  } catch (e) {}
+  try {
+    const XP = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+    if (XP && !XP.__ec5p) {
+      const oOpen = XP.open, oSend = XP.send;
+      XP.open = function (m, u) { try { this.__ec5pm = m; this.__ec5pu = u; } catch (e) {} return oOpen.apply(this, arguments); };
+      XP.send = function (body) {
+        try { const u = this.__ec5pu || '', m = this.__ec5pm || 'GET', b = (typeof body === 'string') ? body : '';
+          this.addEventListener('load', function () { try { post(m, u, b, this.responseText); } catch (e) {} }); } catch (e) {}
+        return oSend.apply(this, arguments);
+      };
+      XP.__ec5p = true;
+    }
+  } catch (e) {}
 })();
