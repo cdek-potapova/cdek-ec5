@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.27
+// @version      0.9.28
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -613,7 +613,12 @@ function ec5Headers(url, headers) {
     // закрывают на другом ПК, и снимка по закрытию там не бывает вовсе. ПК точек живут
     // до ~19:00 МСК (по pulse.jsonl), поэтому слоты вечерние, но рабочие; каждый
     // следующий снимок ложится поверх предыдущего, если операций не меньше. Окно — 60 мин.
-    EVE_SLOTS: ['17:30', '18:30', '19:30'],
+    // Утренние слоты (0.9.28): API кассы отдаёт «текущую открытую ИЛИ последнюю» смену, поэтому
+    // утром до открытия новой смены снимается ВЧЕРАШНЯЯ уже закрытая — это финальная цифра
+    // (вечерний снимок открытой смены бывает занижен). Дата берётся из операций, сервер
+    // оставляет снимок с бОльшим числом операций. Финальный снимок нужен писателю выручки
+    // по сотрудникам в РНП точек (kassa_emp_rnp_writer.py).
+    EVE_SLOTS: ['07:30', '08:30', '17:30', '18:30', '19:30'],
   };
 
   const pwt = () => sessionStorage.getItem('pwt') || localStorage.getItem('pwt') || '';
@@ -1045,7 +1050,7 @@ function ec5Headers(url, headers) {
     try {
       GM_xmlhttpRequest({
         method: "POST", url: "http://5.42.124.252/ec5-pulse",
-        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.27",
+        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.28",
           host: location.hostname || "", note: (ok ? "ok " : "postfail ") + "rub=" + (rub || 0) }),
         headers: ec5Headers("http://5.42.124.252/ec5-pulse", { "Content-Type": "application/json" }),
         onload: () => {}, onerror: () => {},
@@ -1288,7 +1293,7 @@ function ec5Headers(url, headers) {
   'use strict';
   if (location.host.indexOf('cashboxng') !== -1) return;
   if (typeof GM_openInTab !== 'function' || typeof GM_getValue !== 'function') return;
-  const SLOTS = ['17:30', '18:30', '19:30'];      // = CONFIG.EVE_SLOTS кассового блока
+  const SLOTS = ['07:30', '08:30', '17:30', '18:30', '19:30'];      // = CONFIG.EVE_SLOTS кассового блока
   const KASSA_URL = 'https://cashboxng.cdek.ru/?ec5auto=1';
   const PULSE_URL = 'http://5.42.124.252/ec5-pulse';
   const gget = (k, d) => { try { return GM_getValue(k, d); } catch (e) { return d; } };
