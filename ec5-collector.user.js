@@ -1507,11 +1507,7 @@ function ec5Headers(url, headers) {
       const srcs = Array.from(document.querySelectorAll('iframe')).map((f) => String(f.src || '').split('?')[0].slice(0, 120)).filter(Boolean);
       const note = srcs.join(' ').slice(0, 900); if (!note || note === last) return; last = note;
       GM_xmlhttpRequest({ method: 'POST', url: PULSE, headers: ec5Headers(PULSE, { 'Content-Type': 'application/json' }),
-        data: JSON.stringify({ event: 'iframes', rows: srcs.length, host: location.hostname, ver: '      const u = String(url || ''); if (u.indexOf('gateway.cdek.ru') === -1 && u.indexOf('/web/') === -1) return;
-      const onWh = location.host.indexOf('warehouseng') !== -1;          // склад: «Комплексный приход» живёт тут
-      const isNav = u.indexOf('strapi-bff/web/collection/nav') !== -1;  // справочник меню ЭК5 — нужен целиком
-      if (!onWh && !isNav && KNOWN.some((k) => u.indexOf(k) !== -1)) return;
-      if (/front-metrics|web-metrics|navmessages|feature-toggle|sendStats/.test(u)) return;', note }), onload: () => {}, onerror: () => {} });
+        data: JSON.stringify({ event: 'iframes', rows: srcs.length, host: location.hostname, ver: '0.9.29', note }), onload: () => {}, onerror: () => {} });
     } catch (e) {}
   }
   setTimeout(tick, 60 * 1000); setInterval(tick, 5 * 60 * 1000);
