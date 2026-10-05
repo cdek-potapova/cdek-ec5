@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.28
+// @version      0.9.29
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
 // @match        https://cashboxng.cdek.ru/*
+// @match        https://warehouseng.cdek.ru/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @grant        GM_setValue
@@ -56,6 +57,7 @@ function ec5Headers(url, headers) {
   'use strict';
   // На cashboxng работает ТОЛЬКО кассовый блок (ниже) — трафик/упаковка/сотрудники тут не нужны.
   if (location.host.indexOf('cashboxng') !== -1) return;
+  if (location.host.indexOf('warehouseng') !== -1) return;   // на складе работает только разведка (0.9.29)
 
   const CONFIG = {
     GATEWAY: 'https://gateway.cdek.ru',
@@ -1030,7 +1032,8 @@ function ec5Headers(url, headers) {
 // ===================== БЛОК УПАКОВКИ (влит из vault ec5-upack 0.1.0; сбор Superset -> /ec5-upack) =====================
 (function () {
   "use strict";
-  if (location.host.indexOf('cashboxng') !== -1) return;  // упаковка — на ek5
+  if (location.host.indexOf('cashboxng') !== -1) return;
+  if (location.host.indexOf('warehouseng') !== -1) return;   // на складе работает только разведка (0.9.29)  // упаковка — на ek5
   // --- развязка с трафиком/кассой: свой namespace, свои ключи upack:* ---
   const SRV = "http://5.42.124.252/ec5-upack";
   const SUP = "https://superset.cdek.ru";
@@ -1050,7 +1053,7 @@ function ec5Headers(url, headers) {
     try {
       GM_xmlhttpRequest({
         method: "POST", url: "http://5.42.124.252/ec5-pulse",
-        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.28",
+        data: JSON.stringify({ event: "upack", rows: qty || 0, ver: "0.9.29",
           host: location.hostname || "", note: (ok ? "ok " : "postfail ") + "rub=" + (rub || 0) }),
         headers: ec5Headers("http://5.42.124.252/ec5-pulse", { "Content-Type": "application/json" }),
         onload: () => {}, onerror: () => {},
@@ -1201,7 +1204,8 @@ function ec5Headers(url, headers) {
 // ===================== БЛОК СОТРУДНИКОВ (getEmployeeList -> /ec5-employees, раз в сутки) =====================
 (function () {
   'use strict';
-  if (location.host.indexOf('cashboxng') !== -1) return;   // сотрудники — на ek5/orderec5
+  if (location.host.indexOf('cashboxng') !== -1) return;
+  if (location.host.indexOf('warehouseng') !== -1) return;   // на складе работает только разведка (0.9.29)   // сотрудники — на ek5/orderec5
   const SRV = 'http://5.42.124.252/ec5-employees';
   const U = 'https://gateway.cdek.ru/coworker/web/coworker/v1/employee/getEmployeeList';
   const DAYKEY = 'ec5emp:lastrun';
@@ -1292,6 +1296,7 @@ function ec5Headers(url, headers) {
 (function () {
   'use strict';
   if (location.host.indexOf('cashboxng') !== -1) return;
+  if (location.host.indexOf('warehouseng') !== -1) return;   // на складе работает только разведка (0.9.29)
   if (typeof GM_openInTab !== 'function' || typeof GM_getValue !== 'function') return;
   const SLOTS = ['07:30', '08:30', '17:30', '18:30', '19:30'];      // = CONFIG.EVE_SLOTS кассового блока
   const KASSA_URL = 'https://cashboxng.cdek.ru/?ec5auto=1';
@@ -1344,6 +1349,7 @@ function ec5Headers(url, headers) {
 (function () {
   'use strict';
   if (location.host.indexOf('cashboxng') !== -1) return;
+  if (location.host.indexOf('warehouseng') !== -1) return;   // на складе работает только разведка (0.9.29)
   if (typeof GM_xmlhttpRequest !== 'function' || typeof GM_getValue !== 'function') return;
   const SUP = 'https://superset.cdek.ru', SRV = 'http://5.42.124.252/ec5-stats', PULSE = 'http://5.42.124.252/ec5-pulse';
   const CODES = ['MSK548', 'MSK456', 'KAM32', 'MSK2432'];
@@ -1440,6 +1446,7 @@ function ec5Headers(url, headers) {
 (function () {
   'use strict';
   if (location.host.indexOf('cashboxng') !== -1) return;
+  if (location.host.indexOf('warehouseng') !== -1) return;   // на складе работает только разведка (0.9.29)
   if (typeof GM_xmlhttpRequest !== 'function') return;
   const PROBE = 'http://5.42.124.252/ec5-probe';
   const KNOWN = ['/order/web/journal/getFilterData', '/order/web/order/getByNumber', '/coworker/web/', '/cashbox-operating/', '/ec5-'];
@@ -1449,11 +1456,14 @@ function ec5Headers(url, headers) {
     try {
       if (new Date().toDateString() !== day) { day = new Date().toDateString(); sent = 0; seen.clear(); }
       const u = String(url || ''); if (u.indexOf('gateway.cdek.ru') === -1 && u.indexOf('/web/') === -1) return;
-      if (KNOWN.some((k) => u.indexOf(k) !== -1)) return;
+      const onWh = location.host.indexOf('warehouseng') !== -1;          // склад: «Комплексный приход» живёт тут
+      const isNav = u.indexOf('strapi-bff/web/collection/nav') !== -1;  // справочник меню ЭК5 — нужен целиком
+      if (!onWh && !isNav && KNOWN.some((k) => u.indexOf(k) !== -1)) return;
+      if (/front-metrics|web-metrics|navmessages|feature-toggle|sendStats/.test(u)) return;
       const key = u.split('?')[0] + '|' + cut(body, 200);
       if (seen.has(key) || sent >= 60) return; seen.add(key); sent++;
       GM_xmlhttpRequest({ method: 'POST', url: PROBE, headers: ec5Headers(PROBE, { 'Content-Type': 'application/json' }),
-        data: JSON.stringify({ method, url: cut(u, 300), body: cut(body, 6000), resp: cut(resp, 1500) }), onload: () => {}, onerror: () => {} });
+        data: JSON.stringify({ method, url: cut(u, 300), body: cut(body, 6000), resp: cut(resp, isNav ? 120000 : (onWh ? 6000 : 1500)), host: location.host }), onload: () => {}, onerror: () => {} });
     } catch (e) {}
   }
   try {
@@ -1482,4 +1492,27 @@ function ec5Headers(url, headers) {
       XP.__ec5p = true;
     }
   } catch (e) {}
+})();
+
+// ===================== РАЗВЕДКА ВКЛАДОК ЭК5 (0.9.29; на ek5) =====================
+// Разделы ЭК5 открываются во вкладках-iframe на своих поддоменах (cashboxng, coworker,
+// warehouseng…). Раз в 5 минут шлём список адресов открытых iframe — чтобы знать, на каком
+// поддомене живёт «Комплексный приход» и не гадать.
+(function () {
+  'use strict';
+  if (location.host !== 'ek5.cdek.ru' || typeof GM_xmlhttpRequest !== 'function') return;
+  const PULSE = 'http://5.42.124.252/ec5-pulse'; let last = '';
+  function tick() {
+    try {
+      const srcs = Array.from(document.querySelectorAll('iframe')).map((f) => String(f.src || '').split('?')[0].slice(0, 120)).filter(Boolean);
+      const note = srcs.join(' ').slice(0, 900); if (!note || note === last) return; last = note;
+      GM_xmlhttpRequest({ method: 'POST', url: PULSE, headers: ec5Headers(PULSE, { 'Content-Type': 'application/json' }),
+        data: JSON.stringify({ event: 'iframes', rows: srcs.length, host: location.hostname, ver: '      const u = String(url || ''); if (u.indexOf('gateway.cdek.ru') === -1 && u.indexOf('/web/') === -1) return;
+      const onWh = location.host.indexOf('warehouseng') !== -1;          // склад: «Комплексный приход» живёт тут
+      const isNav = u.indexOf('strapi-bff/web/collection/nav') !== -1;  // справочник меню ЭК5 — нужен целиком
+      if (!onWh && !isNav && KNOWN.some((k) => u.indexOf(k) !== -1)) return;
+      if (/front-metrics|web-metrics|navmessages|feature-toggle|sendStats/.test(u)) return;', note }), onload: () => {}, onerror: () => {} });
+    } catch (e) {}
+  }
+  setTimeout(tick, 60 * 1000); setInterval(tick, 5 * 60 * 1000);
 })();
