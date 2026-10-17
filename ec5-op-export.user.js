@@ -1,0 +1,147 @@
+// ==UserScript==
+// @name         EC5 Отдел продаж — ночные выгрузки (Superset, ОМП, договоры)
+// @namespace    cdek.maria.opexport
+// @version      0.1.0
+// @description  Ставится на ноут аналитика ОП (работает 24/7, залогинен в ЭК5 и Superset). Ночью ~05:00 и по кнопке выполняет задания с сервера и шлёт результат; плюс пассивно записывает запросы разделов ЭК5/Superset, чтобы задания можно было собрать без ручного разбора API.
+// @author       Артём
+// @match        https://*.cdek.ru/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @connect      gateway.cdek.ru
+// @connect      superset.cdek.ru
+// @connect      5.42.124.252
+// @downloadURL  http://5.42.124.252/ec5-op-9t3kq.user.js
+// @updateURL    http://5.42.124.252/ec5-op-9t3kq.user.js
+// @run-at       document-idle
+// ==/UserScript==
+
+/* Архитектура (чтобы не переустанавливать скрипт каждый раз):
+ *  1) РАЗВЕДКА — на любой странице *.cdek.ru слушаем собственные запросы приложения (fetch/XHR)
+ *     к gateway.cdek.ru и superset.cdek.ru и шлём адрес+тело+начало ответа в /ec5-op-probe.
+ *     Когда аналитик один раз нажмёт «Выгрузить в Excel» в ОМП/Договорах или откроет дашборд
+ *     маржинальности, нужные запросы окажутся на сервере.
+ *  2) ЗАДАНИЯ — список берём с сервера (/ec5-op-config): {id, kind: 'superset'|'gateway',
+ *     method, url, body, resp: 'json'|'xlsx'}. Выполняем ночью в слот (по умолчанию 05:00
+ *     по часам ноута) и по кнопке меню, результат — в /ec5-op. Новое задание = правка конфига
+ *     на сервере, скрипт трогать не надо. gateway-запросы идут с токеном pwt из ЭК5, поэтому
+ *     исполнитель живёт только на вкладке ek5.cdek.ru (держать открытой, как обычно).
+ */
+(function () {
+  'use strict';
+  const SRV = 'http://5.42.124.252';
+  const KEY = '__OP_KEY__';                          // подставляет сервер при выдаче файла
+  const VER = '0.1.0';
+  const SLOTS = ['05:00'];                           // локальное время ноута; окно 90 минут
+  const cut = (s, n) => String(s == null ? '' : s).slice(0, n);
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const log = (...a) => console.log('[op-export]', ...a);
+  const gget = (k, d) => { try { return GM_getValue(k, d); } catch (e) { return d; } };
+  const gset = (k, v) => { try { GM_setValue(k, v); } catch (e) {} };
+  const pwt = () => { try { return sessionStorage.getItem('pwt') || localStorage.getItem('pwt') || ''; } catch (e) { return ''; } };
+
+  function gm(method, url, body, headers, responseType) {
+    return new Promise((res, rej) => {
+      GM_xmlhttpRequest({ method, url, data: body || null, headers: headers || {}, timeout: 180000, responseType: responseType || 'text',
+        onload: (r) => res(r), onerror: () => rej(new Error('net ' + url)), ontimeout: () => rej(new Error('timeout ' + url)) });
+    });
+  }
+  const post = (path, obj) => gm('POST', SRV + path + '?k=' + KEY, JSON.stringify(obj), { 'Content-Type': 'application/json' });
+
+  // ---------- 1. РАЗВЕДКА ----------
+  const seen = new Set(); let sent = 0, day = new Date().toDateString();
+  function probe(method, url, body, resp) {
+    try {
+      if (new Date().toDateString() !== day) { day = new Date().toDateString(); sent = 0; seen.clear(); }
+      const u = String(url || '');
+      if (u.indexOf('gateway.cdek.ru') === -1 && u.indexOf('superset.cdek.ru') === -1 && u.indexOf('/api/v1/') === -1 && u.indexOf('/web/') === -1) return;
+      if (/front-metrics|web-metrics|navmessages|feature-toggle|sendStats|usersettingsstorage|autocomplete|prompts|isAllowed|rating-products|5\.42\.124\.252/.test(u)) return;
+      const key = u.split('?')[0] + '|' + cut(body, 300);
+      if (seen.has(key) || sent >= 300) return; seen.add(key); sent++;
+      post('/ec5-op-probe', { method, url: cut(u, 400), body: cut(body, 20000), resp: cut(resp, 20000), host: location.host, page: cut(location.href, 200) }).catch(() => {});
+    } catch (e) {}
+  }
+  try {
+    const of = window.fetch;
+    if (typeof of === 'function' && !of.__op) {
+      const wf = function (input, init) {
+        let url = ''; try { url = (typeof input === 'string') ? input : (input && input.url) || ''; } catch (e) {}
+        const method = (init && init.method) || 'GET', body = (init && typeof init.body === 'string') ? init.body : '';
+        const p = of.apply(this, arguments);
+        try { p.then((r) => { try { const ct = r.headers.get('content-type') || ''; if (/json|text/.test(ct)) r.clone().text().then((t) => probe(method, url, body, t)).catch(() => {}); else probe(method, url, body, '[' + ct + ']'); } catch (e) {} }).catch(() => {}); } catch (e) {}
+        return p;
+      };
+      wf.__op = true; window.fetch = wf;
+    }
+  } catch (e) {}
+  try {
+    const XP = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+    if (XP && !XP.__op) {
+      const oOpen = XP.open, oSend = XP.send;
+      XP.open = function (m, u) { try { this.__opm = m; this.__opu = u; } catch (e) {} return oOpen.apply(this, arguments); };
+      XP.send = function (body) {
+        try { const u = this.__opu || '', m = this.__opm || 'GET', b = (typeof body === 'string') ? body : '';
+          this.addEventListener('load', function () { try { const t = (this.responseType === '' || this.responseType === 'text') ? this.responseText : '[' + this.responseType + ']'; probe(m, u, b, t); } catch (e) {} }); } catch (e) {}
+        return oSend.apply(this, arguments);
+      };
+      XP.__op = true;
+    }
+  } catch (e) {}
+
+  // ---------- 2. ЗАДАНИЯ (только на ek5.cdek.ru) ----------
+  if (location.host !== 'ek5.cdek.ru') return;
+  async function loadJobs() {
+    const r = await gm('GET', SRV + '/ec5-op-config?k=' + KEY);
+    if (r.status !== 200) throw new Error('конфиг HTTP ' + r.status);
+    return JSON.parse(r.responseText);
+  }
+  function b64(buf) { let s = ''; const b = new Uint8Array(buf); for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); }
+  async function runJob(job, slot) {
+    const t0 = Date.now();
+    const headers = Object.assign({ 'Content-Type': 'application/json', 'Accept': 'application/json' }, job.headers || {});
+    if (job.kind === 'gateway') { if (!pwt()) throw new Error('нет токена pwt — ЭК5 не залогинен'); headers['X-Auth-Token'] = pwt(); }
+    if (job.kind === 'superset') { headers['Origin'] = 'https://superset.cdek.ru'; headers['Referer'] = 'https://superset.cdek.ru/'; }
+    let url = job.url, body = job.body;
+    const now = new Date(), y = new Date(now.getTime() - 86400000);
+    const mon0 = iso(new Date(now.getFullYear(), now.getMonth(), 1)), nxt0 = iso(new Date(now.getFullYear(), now.getMonth() + 1, 1));
+    const sub = (s) => String(s).replace(/\{today\}/g, iso(now)).replace(/\{yesterday\}/g, iso(y)).replace(/\{month_start\}/g, mon0).replace(/\{next_month_start\}/g, nxt0)
+      .replace(/\{today_ru\}/g, now.toLocaleDateString('ru-RU')).replace(/\{month_start_ru\}/g, new Date(now.getFullYear(), now.getMonth(), 1).toLocaleDateString('ru-RU'));
+    url = sub(url); if (body && typeof body !== 'string') body = JSON.stringify(body); if (body) body = sub(body);
+    const r = await gm(job.method || 'POST', url, body, headers, job.resp === 'xlsx' ? 'arraybuffer' : 'text');
+    if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' ' + cut(r.responseText, 200));
+    const payload = { job: job.id, kind: job.kind, slot, ver: VER, took_ms: Date.now() - t0, status: r.status };
+    if (job.resp === 'xlsx') payload.xlsx_b64 = b64(r.response); else payload.text = String(r.responseText || '');
+    const pr = await post('/ec5-op', payload);
+    if (pr.status !== 200) throw new Error('сервер не принял: HTTP ' + pr.status + ' ' + cut(pr.responseText, 200));
+    return JSON.parse(pr.responseText || '{}');
+  }
+  let busy = false;
+  async function runAll(slot, manual) {
+    if (busy) return; busy = true;
+    const report = [];
+    try {
+      const cfg = await loadJobs();
+      const jobs = (cfg.jobs || []).filter((j) => j.enabled !== false);
+      if (!jobs.length) { log('заданий нет'); if (manual) alert('Выгрузки: заданий на сервере пока нет'); return; }
+      for (const j of jobs) {
+        try { const res = await runJob(j, slot); report.push('✅ ' + j.id + ': ' + (res.rows != null ? res.rows + ' строк' : 'ок')); log('ok', j.id, res); }
+        catch (e) { report.push('❌ ' + j.id + ': ' + (e && e.message)); log('fail', j.id, e && e.message);
+          post('/ec5-op', { job: j.id, kind: j.kind, slot, ver: VER, error: cut(e && e.message, 500) }).catch(() => {}); }
+      }
+      if (!manual) gset('op:done', slot);
+      if (manual) alert('Выгрузки:\n' + report.join('\n'));
+    } catch (e) { log('не удалось:', e && e.message); if (manual) alert('Выгрузки: ' + (e && e.message)); }
+    finally { busy = false; }
+  }
+  function slotId() {
+    const d = new Date(), hm = d.getHours() * 60 + d.getMinutes();
+    for (const s of SLOTS) { const t = s.split(':').map(Number), m = t[0] * 60 + t[1]; if (hm >= m && hm < m + 90) return iso(d) + '@' + s; }
+    return null;
+  }
+  function tick() { const id = slotId(); if (id && gget('op:done', '') !== id) runAll(id, false); }
+  if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand('📤 Выгрузить сейчас (ОП)', () => runAll('manual@' + new Date().toISOString().slice(0, 16), true));
+  setTimeout(() => { post('/ec5-op', { job: '_heartbeat', ver: VER, slot: 'load', text: '' }).catch(() => {}); }, 15000);
+  setInterval(() => { post('/ec5-op', { job: '_heartbeat', ver: VER, slot: 'tick', text: '' }).catch(() => {}); }, 30 * 60 * 1000);
+  setTimeout(tick, 60 * 1000); setInterval(tick, 5 * 60 * 1000);
+})();
