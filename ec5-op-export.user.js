@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 Отдел продаж — ночные выгрузки (Superset, ОМП, договоры)
 // @namespace    cdek.maria.opexport
-// @version      0.1.0
+// @version      0.2.0
 // @description  Ставится на ноут аналитика ОП (работает 24/7, залогинен в ЭК5 и Superset). Ночью ~05:00 и по кнопке выполняет задания с сервера и шлёт результат; плюс пассивно записывает запросы разделов ЭК5/Superset, чтобы задания можно было собрать без ручного разбора API.
 // @author       Артём
 // @match        https://*.cdek.ru/*
@@ -32,7 +32,7 @@
   'use strict';
   const SRV = 'http://5.42.124.252';
   const KEY = '__OP_KEY__';                          // подставляет сервер при выдаче файла
-  const VER = '0.1.0';
+  const VER = '0.2.0';
   const SLOTS = ['05:00'];                           // локальное время ноута; окно 90 минут
   const cut = (s, n) => String(s == null ? '' : s).slice(0, n);
   const iso = (d) => d.toISOString().slice(0, 10);
@@ -108,10 +108,27 @@
     const sub = (s) => String(s).replace(/\{today\}/g, iso(now)).replace(/\{yesterday\}/g, iso(y)).replace(/\{month_start\}/g, mon0).replace(/\{next_month_start\}/g, nxt0)
       .replace(/\{today_ru\}/g, now.toLocaleDateString('ru-RU')).replace(/\{month_start_ru\}/g, new Date(now.getFullYear(), now.getMonth(), 1).toLocaleDateString('ru-RU'));
     url = sub(url); if (body && typeof body !== 'string') body = JSON.stringify(body); if (body) body = sub(body);
-    const r = await gm(job.method || 'POST', url, body, headers, job.resp === 'xlsx' ? 'arraybuffer' : 'text');
-    if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' ' + cut(r.responseText, 200));
-    const payload = { job: job.id, kind: job.kind, slot, ver: VER, took_ms: Date.now() - t0, status: r.status };
-    if (job.resp === 'xlsx') payload.xlsx_b64 = b64(r.response); else payload.text = String(r.responseText || '');
+    const payload = { job: job.id, kind: job.kind, slot, ver: VER, status: 0 };
+    if (job.paginate) {
+      // список страницами: offset += limit, пока страница не короче limit (или до maxRows)
+      const pg = job.paginate, all = []; const base = JSON.parse(body || '{}'); const lim = pg.pageSize || 100;
+      for (let off = 0; off < (pg.maxRows || 50000); off += lim) {
+        base[pg.offsetField || 'offset'] = off; base[pg.limitField || 'limit'] = lim;
+        const r = await gm(job.method || 'POST', url, JSON.stringify(base), headers, 'text');
+        if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' ' + cut(r.responseText, 200));
+        const items = (JSON.parse(r.responseText || '{}')[pg.itemsKey || 'items']) || [];
+        all.push.apply(all, items); payload.status = r.status;
+        if (items.length < lim) break;
+      }
+      payload.text = JSON.stringify({ items: all });
+    } else {
+      const r = await gm(job.method || 'POST', url, body, headers, job.resp === 'json' ? 'text' : 'arraybuffer');
+      payload.status = r.status;
+      if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' ' + (job.resp === 'json' ? cut(r.responseText, 200) : ''));
+      if (job.resp === 'json') payload.text = String(r.responseText || '');
+      else { payload.file_b64 = b64(r.response); payload.content_type = (/content-type:\s*([^\r\n;]+)/i.exec(r.responseHeaders || '') || [])[1] || ''; }
+    }
+    payload.took_ms = Date.now() - t0;
     const pr = await post('/ec5-op', payload);
     if (pr.status !== 200) throw new Error('сервер не принял: HTTP ' + pr.status + ' ' + cut(pr.responseText, 200));
     return JSON.parse(pr.responseText || '{}');
@@ -139,9 +156,21 @@
     for (const s of SLOTS) { const t = s.split(':').map(Number), m = t[0] * 60 + t[1]; if (hm >= m && hm < m + 90) return iso(d) + '@' + s; }
     return null;
   }
-  function tick() { const id = slotId(); if (id && gget('op:done', '') !== id) runAll(id, false); }
+  // Слот 05:00; если ноут спал/ЭК5 был закрыт — догоняем при первом открытии ЭК5 в тот же день (после 05:00).
+  function tick() {
+    const d = new Date(), id = slotId() || ((d.getHours() * 60 + d.getMinutes()) >= 5 * 60 ? iso(d) + '@05:00' : null);
+    if (id && gget('op:done', '') !== id) runAll(id, false);
+  }
+  // Меню ЭК5 целиком (адреса всех разделов) — раз в день на сервер, чтобы давать прямые ссылки на разделы
+  setTimeout(async () => {
+    try {
+      if (gget('op:navDay', '') === iso(new Date()) || !pwt()) return;
+      const r = await gm('GET', 'https://gateway.cdek.ru/strapi-bff/web/collection/nav', null, { 'X-Auth-Token': pwt(), 'Accept': 'application/json' });
+      if (r.status === 200) { await post('/ec5-op-probe', { method: 'NAV', url: 'nav-full', body: '', resp: String(r.responseText || ''), host: location.host, page: '' }); gset('op:navDay', iso(new Date())); }
+    } catch (e) {}
+  }, 30 * 1000);
   if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand('📤 Выгрузить сейчас (ОП)', () => runAll('manual@' + new Date().toISOString().slice(0, 16), true));
   setTimeout(() => { post('/ec5-op', { job: '_heartbeat', ver: VER, slot: 'load', text: '' }).catch(() => {}); }, 15000);
-  setInterval(() => { post('/ec5-op', { job: '_heartbeat', ver: VER, slot: 'tick', text: '' }).catch(() => {}); }, 30 * 60 * 1000);
+  setInterval(() => { post('/ec5-op', { job: '_heartbeat', ver: VER, slot: 'tick' + (pwt() ? '' : '-nopwt'), text: '' }).catch(() => {}); }, 10 * 60 * 1000);
   setTimeout(tick, 60 * 1000); setInterval(tick, 5 * 60 * 1000);
 })();
