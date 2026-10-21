@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 Отдел продаж — ночные выгрузки (Superset, ОМП, договоры)
 // @namespace    cdek.maria.opexport
-// @version      0.2.0
+// @version      0.2.1
 // @description  Ставится на ноут аналитика ОП (работает 24/7, залогинен в ЭК5 и Superset). Ночью ~05:00 и по кнопке выполняет задания с сервера и шлёт результат; плюс пассивно записывает запросы разделов ЭК5/Superset, чтобы задания можно было собрать без ручного разбора API.
 // @author       Артём
 // @match        https://*.cdek.ru/*
@@ -32,7 +32,7 @@
   'use strict';
   const SRV = 'http://5.42.124.252';
   const KEY = '__OP_KEY__';                          // подставляет сервер при выдаче файла
-  const VER = '0.2.0';
+  const VER = '0.2.1';
   const SLOTS = ['05:00'];                           // локальное время ноута; окно 90 минут
   const cut = (s, n) => String(s == null ? '' : s).slice(0, n);
   const iso = (d) => d.toISOString().slice(0, 10);
@@ -98,6 +98,14 @@
   }
   function b64(buf) { let s = ''; const b = new Uint8Array(buf); for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); }
   async function runJob(job, slot) {
+    let last;
+    for (let a = 0; a < 3; a++) {
+      try { return await runJobOnce(job, slot); }
+      catch (e) { last = e; if (!/HTTP 40[13]/.test(String(e && e.message))) throw e; await new Promise((r) => setTimeout(r, 30000)); }
+    }
+    throw last;
+  }
+  async function runJobOnce(job, slot) {
     const t0 = Date.now();
     const headers = Object.assign({ 'Content-Type': 'application/json', 'Accept': 'application/json' }, job.headers || {});
     if (job.kind === 'gateway') { if (!pwt()) throw new Error('нет токена pwt — ЭК5 не залогинен'); headers['X-Auth-Token'] = pwt(); }
@@ -146,7 +154,11 @@
         catch (e) { report.push('❌ ' + j.id + ': ' + (e && e.message)); log('fail', j.id, e && e.message);
           post('/ec5-op', { job: j.id, kind: j.kind, slot, ver: VER, error: cut(e && e.message, 500) }).catch(() => {}); }
       }
-      if (!manual) gset('op:done', slot);
+      if (!manual) {
+        const bad = report.some((x) => x.indexOf('❌') === 0);
+        const tries = (gget('op:tries:' + slot, 0) || 0) + 1; gset('op:tries:' + slot, tries);
+        if (!bad || tries >= 6) gset('op:done', slot);
+      }
       if (manual) alert('Выгрузки:\n' + report.join('\n'));
     } catch (e) { log('не удалось:', e && e.message); if (manual) alert('Выгрузки: ' + (e && e.message)); }
     finally { busy = false; }
@@ -164,9 +176,9 @@
   // Меню ЭК5 целиком (адреса всех разделов) — раз в день на сервер, чтобы давать прямые ссылки на разделы
   setTimeout(async () => {
     try {
-      if (gget('op:navDay', '') === iso(new Date()) || !pwt()) return;
+      if (gget('op:navDay2', '') === iso(new Date()) || !pwt()) return;
       const r = await gm('GET', 'https://gateway.cdek.ru/strapi-bff/web/collection/nav', null, { 'X-Auth-Token': pwt(), 'Accept': 'application/json' });
-      if (r.status === 200) { await post('/ec5-op-probe', { method: 'NAV', url: 'nav-full', body: '', resp: String(r.responseText || ''), host: location.host, page: '' }); gset('op:navDay', iso(new Date())); }
+      if (r.status === 200) { await post('/ec5-op-probe', { method: 'NAV', url: 'nav-full', body: '', resp: String(r.responseText || ''), host: location.host, page: '' }); gset('op:navDay2', iso(new Date())); }
     } catch (e) {}
   }, 30 * 1000);
   if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand('📤 Выгрузить сейчас (ОП)', () => runAll('manual@' + new Date().toISOString().slice(0, 16), true));
