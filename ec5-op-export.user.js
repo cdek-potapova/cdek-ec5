@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 Отдел продаж — ночные выгрузки (Superset, ОМП, договоры)
 // @namespace    cdek.maria.opexport
-// @version      0.2.2
+// @version      0.2.3
 // @description  Ставится на ноут аналитика ОП (работает 24/7, залогинен в ЭК5 и Superset). Ночью ~05:00 и по кнопке выполняет задания с сервера и шлёт результат; плюс пассивно записывает запросы разделов ЭК5/Superset, чтобы задания можно было собрать без ручного разбора API.
 // @author       Артём
 // @match        https://*.cdek.ru/*
@@ -32,7 +32,7 @@
   'use strict';
   const SRV = 'http://5.42.124.252';
   const KEY = '__OP_KEY__';                          // подставляет сервер при выдаче файла
-  const VER = '0.2.2';
+  const VER = '0.2.3';
   const SLOTS = ['05:00'];                           // локальное время ноута; окно 90 минут
   const cut = (s, n) => String(s == null ? '' : s).slice(0, n);
   const iso = (d) => d.toISOString().slice(0, 10);
@@ -51,15 +51,27 @@
 
   // ---------- 1. РАЗВЕДКА ----------
   const seen = new Set(); let sent = 0, day = new Date().toDateString();
-  function probe(method, url, body, resp) {
+  // заголовки, которые ЭК5 ставит сам (язык, локаль и т.п.), запоминаем по сервису gateway — выгрузка повторяет их
+  const SKIP_H = /^(x-auth-token|authorization|cookie|content-length|content-type|accept)$/i;
+  const svc = (u) => { const m = /gateway\.cdek\.ru\/([^/?#]+)/.exec(String(u || '')); return m ? m[1] : ''; };
+  function rememberHeaders(url, h) {
     try {
+      const s = svc(url); if (!s || !h) return; const keep = {};
+      Object.keys(h).forEach((k) => { if (!SKIP_H.test(k)) keep[k] = String(h[k]); });
+      if (Object.keys(keep).length) gset('op:hdr:' + s, keep);
+    } catch (e) {}
+  }
+  function probe(method, url, body, resp, hdrs) {
+    try {
+      rememberHeaders(url, hdrs);
       if (new Date().toDateString() !== day) { day = new Date().toDateString(); sent = 0; seen.clear(); }
       const u = String(url || '');
       if (u.indexOf('gateway.cdek.ru') === -1 && u.indexOf('superset.cdek.ru') === -1 && u.indexOf('/api/v1/') === -1 && u.indexOf('/web/') === -1) return;
       if (/front-metrics|web-metrics|navmessages|feature-toggle|sendStats|usersettingsstorage|autocomplete|prompts|isAllowed|rating-products|5\.42\.124\.252/.test(u)) return;
       const key = u.split('?')[0] + '|' + cut(body, 300);
       if (seen.has(key) || sent >= 300) return; seen.add(key); sent++;
-      post('/ec5-op-probe', { method, url: cut(u, 400), body: cut(body, 20000), resp: cut(resp, 20000), host: location.host, page: cut(location.href, 200) }).catch(() => {});
+      const hs = {}; Object.keys(hdrs || {}).forEach((k) => { hs[k] = SKIP_H.test(k) ? '<скрыт>' : String(hdrs[k]); });
+      post('/ec5-op-probe', { method, url: cut(u, 400), body: cut(body, 20000), resp: cut(resp, 20000), headers: hs, host: location.host, page: cut(location.href, 200) }).catch(() => {});
     } catch (e) {}
   }
   try {
@@ -68,8 +80,9 @@
       const wf = function (input, init) {
         let url = ''; try { url = (typeof input === 'string') ? input : (input && input.url) || ''; } catch (e) {}
         const method = (init && init.method) || 'GET', body = (init && typeof init.body === 'string') ? init.body : '';
+        const hd = {}; try { const h = (init && init.headers) || (input && input.headers); if (h) { if (typeof h.forEach === 'function') h.forEach((v, k) => { hd[k] = v; }); else Object.assign(hd, h); } } catch (e) {}
         const p = of.apply(this, arguments);
-        try { p.then((r) => { try { const ct = r.headers.get('content-type') || ''; if (/json|text/.test(ct)) r.clone().text().then((t) => probe(method, url, body, t)).catch(() => {}); else probe(method, url, body, '[' + ct + ']'); } catch (e) {} }).catch(() => {}); } catch (e) {}
+        try { p.then((r) => { try { const ct = r.headers.get('content-type') || ''; if (/json|text/.test(ct)) r.clone().text().then((t) => probe(method, url, body, t, hd)).catch(() => {}); else probe(method, url, body, '[' + ct + ']', hd); } catch (e) {} }).catch(() => {}); } catch (e) {}
         return p;
       };
       wf.__op = true; window.fetch = wf;
@@ -78,11 +91,12 @@
   try {
     const XP = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
     if (XP && !XP.__op) {
-      const oOpen = XP.open, oSend = XP.send;
-      XP.open = function (m, u) { try { this.__opm = m; this.__opu = u; } catch (e) {} return oOpen.apply(this, arguments); };
+      const oOpen = XP.open, oSend = XP.send, oSet = XP.setRequestHeader;
+      XP.open = function (m, u) { try { this.__opm = m; this.__opu = u; this.__oph = {}; } catch (e) {} return oOpen.apply(this, arguments); };
+      XP.setRequestHeader = function (k, v) { try { (this.__oph = this.__oph || {})[k] = v; } catch (e) {} return oSet.apply(this, arguments); };
       XP.send = function (body) {
         try { const u = this.__opu || '', m = this.__opm || 'GET', b = (typeof body === 'string') ? body : '';
-          this.addEventListener('load', function () { try { const t = (this.responseType === '' || this.responseType === 'text') ? this.responseText : '[' + this.responseType + ']'; probe(m, u, b, t); } catch (e) {} }); } catch (e) {}
+          this.addEventListener('load', function () { try { const t = (this.responseType === '' || this.responseType === 'text') ? this.responseText : '[' + this.responseType + ']'; probe(m, u, b, t, this.__oph); } catch (e) {} }); } catch (e) {}
         return oSend.apply(this, arguments);
       };
       XP.__op = true;
@@ -107,7 +121,10 @@
   }
   async function runJobOnce(job, slot) {
     const t0 = Date.now();
-    const headers = Object.assign({ 'Content-Type': 'application/json', 'Accept': 'application/json' }, job.headers || {});
+    // база + заголовки, которые сам ЭК5 ставил этому сервису (язык и т.п.) + явные из задания
+    const headers = Object.assign({ 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      job.kind === 'gateway' ? Object.assign({ 'X-User-Lang': 'rus', 'X-User-Locale': 'ru_RU' }, gget('op:hdr:' + svc(job.url), {}) || {}) : {},
+      job.headers || {});
     if (job.kind === 'gateway') { if (!pwt()) throw new Error('нет токена pwt — ЭК5 не залогинен'); headers['X-Auth-Token'] = pwt(); }
     if (job.kind === 'superset') { headers['Origin'] = 'https://superset.cdek.ru'; headers['Referer'] = 'https://superset.cdek.ru/'; }
     let url = job.url, body = job.body;
