@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 Отдел продаж — ночные выгрузки (Superset, ОМП, договоры)
 // @namespace    cdek.maria.opexport
-// @version      0.2.1
+// @version      0.2.2
 // @description  Ставится на ноут аналитика ОП (работает 24/7, залогинен в ЭК5 и Superset). Ночью ~05:00 и по кнопке выполняет задания с сервера и шлёт результат; плюс пассивно записывает запросы разделов ЭК5/Superset, чтобы задания можно было собрать без ручного разбора API.
 // @author       Артём
 // @match        https://*.cdek.ru/*
@@ -32,7 +32,7 @@
   'use strict';
   const SRV = 'http://5.42.124.252';
   const KEY = '__OP_KEY__';                          // подставляет сервер при выдаче файла
-  const VER = '0.2.1';
+  const VER = '0.2.2';
   const SLOTS = ['05:00'];                           // локальное время ноута; окно 90 минут
   const cut = (s, n) => String(s == null ? '' : s).slice(0, n);
   const iso = (d) => d.toISOString().slice(0, 10);
@@ -114,7 +114,8 @@
     const now = new Date(), y = new Date(now.getTime() - 86400000);
     const mon0 = iso(new Date(now.getFullYear(), now.getMonth(), 1)), nxt0 = iso(new Date(now.getFullYear(), now.getMonth() + 1, 1));
     const sub = (s) => String(s).replace(/\{today\}/g, iso(now)).replace(/\{yesterday\}/g, iso(y)).replace(/\{month_start\}/g, mon0).replace(/\{next_month_start\}/g, nxt0)
-      .replace(/\{today_ru\}/g, now.toLocaleDateString('ru-RU')).replace(/\{month_start_ru\}/g, new Date(now.getFullYear(), now.getMonth(), 1).toLocaleDateString('ru-RU'));
+      .replace(/\{today_ru\}/g, now.toLocaleDateString('ru-RU')).replace(/\{month_start_ru\}/g, new Date(now.getFullYear(), now.getMonth(), 1).toLocaleDateString('ru-RU'))
+      .replace(/\{pwt\}/g, pwt()); // некоторые сервисы (ОМП) ждут токен ещё и в теле запроса
     url = sub(url); if (body && typeof body !== 'string') body = JSON.stringify(body); if (body) body = sub(body);
     const payload = { job: job.id, kind: job.kind, slot, ver: VER, status: 0 };
     if (job.paginate) {
@@ -147,10 +148,12 @@
     const report = [];
     try {
       const cfg = await loadJobs();
-      const jobs = (cfg.jobs || []).filter((j) => j.enabled !== false);
-      if (!jobs.length) { log('заданий нет'); if (manual) alert('Выгрузки: заданий на сервере пока нет'); return; }
+      const today = iso(new Date());
+      // авто-прогон делает только то, что сегодня ещё не выгрузилось (новое задание с сервера догоняется в тот же день)
+      const jobs = (cfg.jobs || []).filter((j) => j.enabled !== false && (manual || gget('op:ok:' + j.id, '') !== today));
+      if (!jobs.length) { if (!manual) gset('op:done', slot); log('заданий нет'); if (manual) alert('Выгрузки: заданий на сервере пока нет'); return; }
       for (const j of jobs) {
-        try { const res = await runJob(j, slot); report.push('✅ ' + j.id + ': ' + (res.rows != null ? res.rows + ' строк' : 'ок')); log('ok', j.id, res); }
+        try { const res = await runJob(j, slot); gset('op:ok:' + j.id, today); report.push('✅ ' + j.id + ': ' + (res.rows != null ? res.rows + ' строк' : 'ок')); log('ok', j.id, res); }
         catch (e) { report.push('❌ ' + j.id + ': ' + (e && e.message)); log('fail', j.id, e && e.message);
           post('/ec5-op', { job: j.id, kind: j.kind, slot, ver: VER, error: cut(e && e.message, 500) }).catch(() => {}); }
       }
@@ -171,7 +174,15 @@
   // Слот 05:00; если ноут спал/ЭК5 был закрыт — догоняем при первом открытии ЭК5 в тот же день (после 05:00).
   function tick() {
     const d = new Date(), id = slotId() || ((d.getHours() * 60 + d.getMinutes()) >= 5 * 60 ? iso(d) + '@05:00' : null);
-    if (id && gget('op:done', '') !== id) runAll(id, false);
+    if (!id) return;
+    if (gget('op:done', '') !== id) { runAll(id, false); return; }
+    // раз в 30 мин сверяемся с сервером: появилось новое задание или какое-то сегодня не прошло — догоняем (до 6 попыток в день)
+    if (Date.now() - (gget('op:cfgAt', 0) || 0) < 30 * 60 * 1000 || (gget('op:tries:' + id, 0) || 0) >= 6) return;
+    gset('op:cfgAt', Date.now());
+    loadJobs().then((cfg) => {
+      const t = iso(new Date());
+      if ((cfg.jobs || []).some((j) => j.enabled !== false && gget('op:ok:' + j.id, '') !== t)) runAll(id, false);
+    }).catch(() => {});
   }
   // Меню ЭК5 целиком (адреса всех разделов) — раз в день на сервер, чтобы давать прямые ссылки на разделы
   setTimeout(async () => {
