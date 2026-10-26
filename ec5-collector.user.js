@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EC5 База проходящего трафика (сбор по ПВЗ)
 // @namespace    cdek.maria.traffic
-// @version      0.9.29
+// @version      0.9.30
 // @description  Собирает за день клиентов ПВЗ из EC5 (физики-отправители = лиды + выдача), авто-определяя офис аккаунта. Богатые колонки для фильтрации в таблице. Запуск из меню Tampermonkey.
 // @match        https://orderec5ng.cdek.ru/*
 // @match        https://ek5.cdek.ru/*
@@ -621,6 +621,11 @@ function ec5Headers(url, headers) {
     // оставляет снимок с бОльшим числом операций. Финальный снимок нужен писателю выручки
     // по сотрудникам в РНП точек (kassa_emp_rnp_writer.py).
     EVE_SLOTS: ['07:30', '08:30', '17:30', '18:30', '19:30'],
+    // Чужие кассы того же франчайзи (0.9.30): на Фуд-Сити касса-вкладка не открывается
+    // с 17.09, а ПК там на старом скрипте без открывашки. Пробуем снять кассу Фуда из
+    // сессии другой точки (ИП Рената, как ТЯК). Нет доступа/пусто — только пульс.
+    EXTRA_CASHES: [{ uuid: '12c6cbdd-a387-4bc7-8829-7f785508e6b0', office: 'CASH-12c6cbdd',
+                     pvz: 'KAM32, ПВЗ, Коммунарка, ш. Калужское, 22-й километр, 10, RU' }],
   };
 
   const pwt = () => sessionStorage.getItem('pwt') || localStorage.getItem('pwt') || '';
@@ -863,7 +868,7 @@ function ec5Headers(url, headers) {
           (hasReturn ? `, возврат у: ${returnOperators.join(', ')}` : '') +
           (incomplete ? ' ⚠️ НЕПОЛНАЯ → сигнал' : '') + (empty ? ' ⚠️ ПУСТАЯ → вероятно не та смена' : ''));
     }
-    return { perOperator: agg, diagnostics: diag, hasReturn, returnOperators, collected, foundCount: foundTotal, incomplete, empty, date: shiftDate };
+    return { perOperator: agg, diagnostics: diag, hasReturn, returnOperators, collected, foundCount: foundTotal, incomplete, empty, date: shiftDate, codes: [...seen] };
   }
 
   const isoDay = () => { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
@@ -886,6 +891,7 @@ function ec5Headers(url, headers) {
     const ident = await resolveIdentity();
     log && log(`касса точки: source=${ident.source}, office=${ident.officeCode}, касс=${ident.cashUuids.length}`);
     const shift = await collectShift(log, ident.cashUuids);
+    lastOwn = { cashUuids: ident.cashUuids, codes: new Set(shift.codes || []), office: ident.officeCode };
     const day = isoFromDDMM(shift.date) || isoDay();   // дата СМЕНЫ (по операциям), не «сегодня»
     // ключ дедупа привязан к офису — чтобы разные точки не гасили снятие друг у друга
     const key = sentKey(ident.officeCode + ':' + day);
@@ -936,6 +942,37 @@ function ec5Headers(url, headers) {
     return savedOurs;
   }
 
+  // ---------- Чужие кассы (0.9.30): снимок кассы другой точки из этой сессии ----------
+  let lastOwn = null;
+  async function sendExtra(log) {
+    if (!lastOwn) return;
+    for (const x of (CONFIG.EXTRA_CASHES || [])) {
+      if ((lastOwn.cashUuids || []).indexOf(x.uuid) !== -1) continue;     // это и есть наша касса
+      const who = { pvz: x.pvz, office: x.office, uuids: [x.uuid], source: 'remote:' + lastOwn.office };
+      let shift;
+      try { shift = await collectShift(log, [x.uuid]); }
+      catch (e) { pulse('kassa-extra-fail', 0, who); continue; }
+      // сервер мог проигнорировать фильтр и отдать операции НАШЕЙ кассы — такое не пишем
+      const overlap = (shift.codes || []).some((c) => lastOwn.codes.has(c));
+      if (shift.empty || shift.incomplete || overlap) {
+        log && log('чужая касса ' + x.office + ': ' + (overlap ? 'операции совпали со своей кассой' : shift.empty ? 'пусто/нет доступа' : 'неполная') + ' — не шлю');
+        pulse(overlap ? 'kassa-extra-overlap' : shift.empty ? 'kassa-extra-empty' : 'kassa-extra-incomplete', shift.collected, who);
+        continue;
+      }
+      const payload = { source: 'ec5-kassa-userscript', version: CONFIG.VER, date: isoFromDDMM(shift.date) || isoDay(),
+        snapshot: 'schedule', shiftState: null, snapTime: new Date().toISOString(),
+        pvz: x.pvz, office: x.office, detectSource: who.source, cashUuids: [x.uuid],
+        hasReturn: shift.hasReturn, returnOperators: shift.returnOperators,
+        incomplete: shift.incomplete, empty: shift.empty, collected: shift.collected, foundCount: shift.foundCount,
+        perOperator: shift.perOperator, diagnostics: shift.diagnostics };
+      try {
+        const r = await http('POST', CONFIG.OURS_URL, payload);
+        const ok = r.status >= 200 && r.status < 300 && (!r.json || r.json.ok !== false);
+        pulse(ok ? 'kassa-extra-ok' : 'kassa-extra-fail', shift.collected, who);
+      } catch (e) { pulse('kassa-extra-fail', 0, who); }
+    }
+  }
+
   // ---------- Плановые вечерние снимки (0.5.0) ----------
   // Слот = «день@ЧЧ:ММ». Отметка о выполнении — в GM-хранилище (общее для всех вкладок и
   // origin'ов этого скрипта), чтобы вкладка ek5-открывашки и вкладка кассира не снимали
@@ -960,6 +997,7 @@ function ec5Headers(url, headers) {
     eveBusy = true;
     try {
       const r = await sendShift(clog, { force: true });
+      try { await sendExtra(clog); } catch (e) { clog('чужая касса: ' + (e && e.message)); }
       // false = нет токена / сервер не принял → повтор через минуту (не больше 5 раз за слот)
       if (r !== false || ++eveNoTokenTries >= 5) { gset(EVE_DONE, id); eveNoTokenTries = 0; if (isAutoTab) { try { window.close(); } catch (e) {} } }
     } catch (e) { clog('плановый снимок не удался: ' + (e && e.message)); }
